@@ -102,11 +102,17 @@ def main() -> None:
         resp.raise_for_status()
         print(f"   Custodian {i}: {resp.json()}")
 
-    # ---- 5. Install on coordinator ----
-    banner("5) Install package on coordinator")
-    resp = client.post(f"{COORDINATOR}/install", json={"program_package": pkg_dict})
+    # ---- 5. Install on coordinator (with Beaver triples) ----
+    banner("5) Install package on coordinator + distribute Beaver triples")
+    resp = client.post(
+        f"{COORDINATOR}/install",
+        json={"program_package": pkg_dict, "generate_beaver": True, "beaver_pool_size": 10},
+    )
     resp.raise_for_status()
-    print(f"   Coordinator: {resp.json()}")
+    install_body = resp.json()
+    print(f"   Coordinator: {install_body}")
+    print(f"   Beaver ready: {install_body.get('beaver_ready')}")
+    print(f"   Beaver pool:  {install_body.get('beaver_pool')} triples per mul node")
 
     # ---- 6. Collect approvals (K of N) ----
     banner(f"6) Collect approvals (need {THRESHOLD} of {NUM_CUSTODIANS})")
@@ -134,8 +140,10 @@ def main() -> None:
     resp.raise_for_status()
     print(f"\n   Program status: {resp.json()['status']}")
 
-    # ---- 8. Run evaluations ----
-    banner("7) Evaluate program")
+    # ---- 8. Run evaluations (inputs Shamir-shared, mul via Beaver) ----
+    banner("7) Evaluate program (Beaver protocol)")
+    print("   Inputs are Shamir-shared — no custodian sees plain values.")
+    print("   Multiplications use the Beaver triple protocol (2 rounds).")
     identity = "alice"
     for x_val in [3, 10, 0]:
         resp = client.post(
@@ -153,6 +161,12 @@ def main() -> None:
             print(f"   f({x_val}) = {result}  (expected {expected}) {match}")
         else:
             print(f"   f({x_val}) → HTTP {resp.status_code}: {resp.text}")
+
+    # Show remaining Beaver pool
+    resp = client.get(f"{COORDINATOR}/beaver_pool/{pkg.program_id}")
+    if resp.status_code == 200:
+        pool_info = resp.json()
+        print(f"\n   Beaver pool remaining: {pool_info['pool_remaining']}")
 
     # ---- 9. Exhaust budget ----
     banner("8) Exhaust budget (budget_per_identity=5)")
@@ -184,7 +198,11 @@ def main() -> None:
     for i, url in enumerate(CUSTODIANS):
         x, y = shares[i]
         client.post(f"{url}/install", json={"program_package": pkg2_dict, "share_x": str(x), "share_y": str(y)})
-    client.post(f"{COORDINATOR}/install", json={"program_package": pkg2_dict})
+    client.post(f"{COORDINATOR}/install", json={
+        "program_package": pkg2_dict,
+        "generate_beaver": True,
+        "beaver_pool_size": 10,
+    })
     for i in range(THRESHOLD):
         resp = client.post(f"{CUSTODIANS[i]}/approve", json={"program_id": pkg2.program_id})
         approval = resp.json()

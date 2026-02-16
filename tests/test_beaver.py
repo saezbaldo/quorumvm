@@ -77,8 +77,23 @@ class TestTripleSharing:
         mul_ids = ["m1", "m2", "m3"]
         triples = generate_triples_for_program(mul_ids, NUM_CUSTODIANS, THRESHOLD)
         assert set(triples.keys()) == set(mul_ids)
-        for nid, ts in triples.items():
-            assert len(ts.a_shares) == NUM_CUSTODIANS
+        for nid, ts_list in triples.items():
+            # Default pool_size=1 → list of one BeaverTripleShares
+            assert isinstance(ts_list, list)
+            assert len(ts_list) == 1
+            assert len(ts_list[0].a_shares) == NUM_CUSTODIANS
+
+    def test_generate_for_program_pool(self):
+        """Pool mode: multiple triples per mul node."""
+        mul_ids = ["m1", "m2"]
+        pool_size = 4
+        triples = generate_triples_for_program(
+            mul_ids, NUM_CUSTODIANS, THRESHOLD, pool_size=pool_size,
+        )
+        for nid, ts_list in triples.items():
+            assert len(ts_list) == pool_size
+            for ts in ts_list:
+                assert len(ts.a_shares) == NUM_CUSTODIANS
 
 
 # =========================================================================
@@ -321,6 +336,7 @@ class TestBeaverE2E:
         coord_module._status.clear()
         coord_module._beaver_ready.clear()
         coord_module._beaver_epsilons.clear()
+        coord_module._beaver_pool_remaining.clear()
         coord_module._policy = coord_module.PolicyEngine()
         coord_module._audit = coord_module.AuditLog()
 
@@ -414,6 +430,7 @@ class TestBeaverE2E:
         coord_module._status.clear()
         coord_module._beaver_ready.clear()
         coord_module._beaver_epsilons.clear()
+        coord_module._beaver_pool_remaining.clear()
         coord_module._policy = coord_module.PolicyEngine()
         coord_module._audit = coord_module.AuditLog()
 
@@ -481,3 +498,291 @@ class TestBeaverE2E:
 
         for c in custodian_clients:
             await c.aclose()
+
+
+# =========================================================================
+# 6. Beaver pool tests (consumption & exhaustion)
+# =========================================================================
+
+
+class TestBeaverPool:
+    """Test that Beaver triples are consumed once per eval and pool exhaustion is enforced."""
+
+    @pytest.fixture()
+    def setup_services(self):
+        """Set up in-process coordinator + custodians with mocked HTTP."""
+        from quorumvm.compiler.dsl_parser import compile_source
+        from quorumvm.compiler.package import PolicyManifest, build_package
+        from quorumvm.custodian.app import CustodianState, create_app as create_custodian
+        from quorumvm.coordinator.app import app as coordinator_app
+        from httpx import ASGITransport, AsyncClient
+
+        # Compile a program with multiplication: f(x)=(x+7)²
+        ir = compile_source(
+            "input x\nconst c = 7\nadd t = x c\nmul y = t t\noutput y"
+        )
+        policy = PolicyManifest(
+            cost_per_eval=1, budget_per_identity=50, max_evals_per_minute=100,
+        )
+        pkg = build_package(ir, version="1.0.0", policy=policy)
+
+        custodian_states = [CustodianState(i) for i in range(NUM_CUSTODIANS)]
+        custodian_apps = [create_custodian(s) for s in custodian_states]
+
+        return {
+            "coordinator_app": coordinator_app,
+            "custodian_apps": custodian_apps,
+            "custodian_states": custodian_states,
+            "pkg": pkg,
+            "ir": ir,
+        }
+
+    async def _setup_program(self, svc, pool_size: int):
+        """Install + activate a program with a given Beaver pool size."""
+        from httpx import ASGITransport, AsyncClient
+        from unittest.mock import patch
+        import quorumvm.coordinator.app as coord_module
+
+        coordinator_app = svc["coordinator_app"]
+        custodian_apps = svc["custodian_apps"]
+        pkg = svc["pkg"]
+
+        # Reset coordinator state
+        coord_module._packages.clear()
+        coord_module._approvals.clear()
+        coord_module._status.clear()
+        coord_module._beaver_ready.clear()
+        coord_module._beaver_epsilons.clear()
+        coord_module._beaver_pool_remaining.clear()
+        coord_module._policy = coord_module.PolicyEngine()
+        coord_module._audit = coord_module.AuditLog()
+
+        pkg_dict = pkg.model_dump()
+
+        custodian_transports = [
+            ASGITransport(app=app) for app in custodian_apps
+        ]
+        custodian_clients = [
+            AsyncClient(transport=t, base_url=f"http://custodian-{i}")
+            for i, t in enumerate(custodian_transports)
+        ]
+
+        # Install on custodians
+        S_v = 42
+        shares = shamir.share(S_v, NUM_CUSTODIANS, THRESHOLD)
+        for i, client in enumerate(custodian_clients):
+            x, y = shares[i]
+            await client.post("/install", json={
+                "program_package": pkg_dict,
+                "share_x": str(x),
+                "share_y": str(y),
+            })
+
+        # Mock HTTP for coordinator → custodian
+        original_post = AsyncClient.post
+
+        async def mock_post(self_client, url: str, **kwargs):
+            for i in range(NUM_CUSTODIANS):
+                prefix = f"http://custodian-{i}:{9100 + i}"
+                if url.startswith(prefix):
+                    path = url[len(prefix):]
+                    return await custodian_clients[i].post(path, **kwargs)
+            return await original_post(self_client, url, **kwargs)
+
+        coord_transport = ASGITransport(app=coordinator_app)
+        coord_client = AsyncClient(
+            transport=coord_transport, base_url="http://coordinator",
+        )
+
+        with patch.object(AsyncClient, "post", mock_post):
+            # Install with specific pool size
+            resp = await coord_client.post("/install", json={
+                "program_package": pkg_dict,
+                "generate_beaver": True,
+                "beaver_pool_size": pool_size,
+            })
+            assert resp.status_code == 200
+            assert resp.json()["beaver_pool"] == pool_size
+
+            # Approve
+            from quorumvm.crypto import signatures
+            for i in range(THRESHOLD):
+                sig = signatures.sign(i, pkg.program_id)
+                await coord_client.post("/approve", json={
+                    "program_id": pkg.program_id,
+                    "custodian_index": i,
+                    "signature": sig,
+                })
+
+        return coord_client, custodian_clients, mock_post
+
+    @pytest.mark.asyncio
+    async def test_pool_allows_multiple_evals(self, setup_services):
+        """A pool of size 3 should allow 3 evaluations."""
+        from unittest.mock import patch
+        from httpx import AsyncClient
+
+        svc = setup_services
+        coord_client, custodian_clients, mock_post = await self._setup_program(svc, pool_size=3)
+
+        with patch.object(AsyncClient, "post", mock_post):
+            for x_val in [3, 10, 0]:
+                resp = await coord_client.post("/eval", json={
+                    "identity_id": "pool-user",
+                    "program_id": svc["pkg"].program_id,
+                    "inputs": {"x": x_val},
+                })
+                assert resp.status_code == 200
+                expected = (x_val + 7) ** 2
+                assert resp.json()["result"] == expected
+
+        for c in custodian_clients:
+            await c.aclose()
+        await coord_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_pool_exhaustion_returns_409(self, setup_services):
+        """After exhausting the pool, further evals should return 409."""
+        from unittest.mock import patch
+        from httpx import AsyncClient
+
+        svc = setup_services
+        coord_client, custodian_clients, mock_post = await self._setup_program(svc, pool_size=2)
+
+        with patch.object(AsyncClient, "post", mock_post):
+            # Use both triples
+            for x_val in [3, 10]:
+                resp = await coord_client.post("/eval", json={
+                    "identity_id": "exhaust-user",
+                    "program_id": svc["pkg"].program_id,
+                    "inputs": {"x": x_val},
+                })
+                assert resp.status_code == 200
+
+            # Third eval should fail with 409
+            resp = await coord_client.post("/eval", json={
+                "identity_id": "exhaust-user",
+                "program_id": svc["pkg"].program_id,
+                "inputs": {"x": 5},
+            })
+            assert resp.status_code == 409
+
+        for c in custodian_clients:
+            await c.aclose()
+        await coord_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_pool_replenish_allows_more_evals(self, setup_services):
+        """After exhausting and replenishing, evals should work again."""
+        from unittest.mock import patch
+        from httpx import AsyncClient
+
+        svc = setup_services
+        coord_client, custodian_clients, mock_post = await self._setup_program(svc, pool_size=1)
+
+        with patch.object(AsyncClient, "post", mock_post):
+            # Use the one triple
+            resp = await coord_client.post("/eval", json={
+                "identity_id": "replenish-user",
+                "program_id": svc["pkg"].program_id,
+                "inputs": {"x": 3},
+            })
+            assert resp.status_code == 200
+            assert resp.json()["result"] == 100
+
+            # Should be exhausted now
+            resp = await coord_client.post("/eval", json={
+                "identity_id": "replenish-user",
+                "program_id": svc["pkg"].program_id,
+                "inputs": {"x": 3},
+            })
+            assert resp.status_code == 409
+
+            # Replenish with 2 more triples
+            resp = await coord_client.post("/replenish_beaver", json={
+                "program_id": svc["pkg"].program_id,
+                "pool_size": 2,
+            })
+            assert resp.status_code == 200
+            assert resp.json()["pool_remaining"] == 2
+
+            # Should work again
+            resp = await coord_client.post("/eval", json={
+                "identity_id": "replenish-user",
+                "program_id": svc["pkg"].program_id,
+                "inputs": {"x": 10},
+            })
+            assert resp.status_code == 200
+            assert resp.json()["result"] == 289
+
+        for c in custodian_clients:
+            await c.aclose()
+        await coord_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_pool_status_endpoint(self, setup_services):
+        """The beaver_pool status endpoint should reflect remaining capacity."""
+        from unittest.mock import patch
+        from httpx import AsyncClient
+
+        svc = setup_services
+        coord_client, custodian_clients, mock_post = await self._setup_program(svc, pool_size=3)
+
+        # Check initial pool
+        resp = await coord_client.get(
+            f"/beaver_pool/{svc['pkg'].program_id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["pool_remaining"] == 3
+
+        with patch.object(AsyncClient, "post", mock_post):
+            # Consume one
+            await coord_client.post("/eval", json={
+                "identity_id": "status-user",
+                "program_id": svc["pkg"].program_id,
+                "inputs": {"x": 3},
+            })
+
+        # Check decremented pool
+        resp = await coord_client.get(
+            f"/beaver_pool/{svc['pkg'].program_id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["pool_remaining"] == 2
+
+        for c in custodian_clients:
+            await c.aclose()
+        await coord_client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_different_evals_use_different_triples(self, setup_services):
+        """Verify that consecutive evals consume different triples (pool decrements)."""
+        from unittest.mock import patch
+        from httpx import AsyncClient
+        import quorumvm.coordinator.app as coord_module
+
+        svc = setup_services
+        coord_client, custodian_clients, mock_post = await self._setup_program(svc, pool_size=5)
+
+        results = []
+        with patch.object(AsyncClient, "post", mock_post):
+            for x_val in [1, 2, 3, 4, 5]:
+                resp = await coord_client.post("/eval", json={
+                    "identity_id": "triple-user",
+                    "program_id": svc["pkg"].program_id,
+                    "inputs": {"x": x_val},
+                })
+                assert resp.status_code == 200
+                results.append(resp.json()["result"])
+
+        # All results should be correct
+        expected = [(x + 7) ** 2 for x in [1, 2, 3, 4, 5]]
+        assert results == expected
+
+        # Pool should be exhausted
+        remaining = coord_module._beaver_pool_remaining[svc["pkg"].program_id]
+        assert remaining == 0
+
+        for c in custodian_clients:
+            await c.aclose()
+        await coord_client.aclose()

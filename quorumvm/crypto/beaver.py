@@ -107,8 +107,12 @@ def generate_triples_for_program(
     mul_node_ids: List[str],
     n: int,
     k: int,
-) -> Dict[str, BeaverTripleShares]:
-    """Generate one Beaver triple per mul node in the program DAG.
+    pool_size: int = 1,
+) -> Dict[str, List[BeaverTripleShares]]:
+    """Generate a pool of Beaver triples per mul node in the program DAG.
+
+    Each mul node gets *pool_size* independent triples.  Each triple is
+    consumed exactly once during evaluation, ensuring security.
 
     Parameters
     ----------
@@ -116,12 +120,17 @@ def generate_triples_for_program(
         The IDs of all ``mul`` nodes in the IR.
     n, k : int
         Shamir parameters (num custodians, threshold).
+    pool_size : int
+        Number of triples per mul node (default 1).
 
     Returns
     -------
-    dict mapping node_id → BeaverTripleShares
+    dict mapping node_id → list of BeaverTripleShares
     """
-    return {nid: generate_triple_shares(n, k) for nid in mul_node_ids}
+    return {
+        nid: [generate_triple_shares(n, k) for _ in range(pool_size)]
+        for nid in mul_node_ids
+    }
 
 
 def custodian_mul_round1(

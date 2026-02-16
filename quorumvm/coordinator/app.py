@@ -24,7 +24,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from quorumvm.config import CUSTODIAN_URLS, NUM_CUSTODIANS, PRIME, THRESHOLD
+from quorumvm.config import CUSTODIAN_URLS, DEFAULT_BEAVER_POOL_SIZE, NUM_CUSTODIANS, PRIME, THRESHOLD
 from quorumvm.coordinator.audit import AuditLog
 from quorumvm.coordinator.policy import PolicyEngine
 from quorumvm.crypto import shamir, signatures
@@ -49,6 +49,8 @@ _approvals: Dict[str, List[tuple]] = {}
 _status: Dict[str, str] = {}
 # program_id -> True if Beaver triples have been distributed
 _beaver_ready: Dict[str, bool] = {}
+# program_id -> remaining triple count (per mul node — they all share the same pool size)
+_beaver_pool_remaining: Dict[str, int] = {}
 # program_id -> {node_id: {epsilon: int, delta: int}} (cached per eval)
 _beaver_epsilons: Dict[str, Dict[str, Dict[str, int]]] = {}
 
@@ -64,6 +66,8 @@ class InstallRequest(BaseModel):
     program_package: Dict[str, Any]
     # Optional: pre-generate Beaver triples during install
     generate_beaver: bool = True
+    # Number of triples per mul node (consumed one per eval)
+    beaver_pool_size: int = DEFAULT_BEAVER_POOL_SIZE
 
 
 class ApproveRequest(BaseModel):
@@ -113,20 +117,24 @@ async def install(req: InstallRequest):
     if mul_nodes and req.generate_beaver:
         n = NUM_CUSTODIANS
         k = THRESHOLD
-        triples = generate_triples_for_program(mul_nodes, n, k)
+        pool_size = req.beaver_pool_size
+        triples = generate_triples_for_program(mul_nodes, n, k, pool_size)
 
         # Distribute to each custodian
         async with httpx.AsyncClient(timeout=10.0) as client:
             for idx in range(n):
-                # Build the triple shares for this custodian
-                custodian_triples: Dict[str, Dict[str, List[int]]] = {}
-                for node_id, triple_shares in triples.items():
-                    cs = triple_shares.for_custodian(idx)
-                    custodian_triples[node_id] = {
-                        "a": list(cs["a"]),
-                        "b": list(cs["b"]),
-                        "c": list(cs["c"]),
-                    }
+                # Build the triple-pool shares for this custodian
+                # node_id -> list of {a, b, c}  (one per pool entry)
+                custodian_triples: Dict[str, List[Dict[str, List[int]]]] = {}
+                for node_id, triple_list in triples.items():
+                    custodian_triples[node_id] = []
+                    for triple_shares in triple_list:
+                        cs = triple_shares.for_custodian(idx)
+                        custodian_triples[node_id].append({
+                            "a": list(cs["a"]),
+                            "b": list(cs["b"]),
+                            "c": list(cs["c"]),
+                        })
 
                 try:
                     url = f"{CUSTODIAN_URLS[idx]}/install_beaver"
@@ -139,10 +147,17 @@ async def install(req: InstallRequest):
                     pass  # Will fail at eval time if too few custodians
 
         _beaver_ready[pid] = True
+        _beaver_pool_remaining[pid] = pool_size
     else:
         _beaver_ready[pid] = len(mul_nodes) == 0  # No muls = ready
+        _beaver_pool_remaining[pid] = 0
 
-    return {"status": "installed", "program_id": pid, "beaver_ready": _beaver_ready[pid]}
+    return {
+        "status": "installed",
+        "program_id": pid,
+        "beaver_ready": _beaver_ready[pid],
+        "beaver_pool": _beaver_pool_remaining.get(pid, 0),
+    }
 
 
 @app.post("/approve")
@@ -225,6 +240,25 @@ async def evaluate(req: EvalRequest):
     if not use_beaver:
         # ---------- Legacy path (no muls or no Beaver triples) ----------
         return await _eval_legacy(pid, request_id, req, input_shares_per_custodian, n, k)
+
+    # ---- Check Beaver pool capacity ----
+    remaining = _beaver_pool_remaining.get(pid, 0)
+    if remaining <= 0:
+        _audit.append(
+            "eval_denied",
+            {
+                "program_id": pid,
+                "identity_id": req.identity_id,
+                "reason": "Beaver triple pool exhausted",
+            },
+        )
+        raise HTTPException(
+            409,
+            "Beaver triple pool exhausted — replenish via POST /replenish_beaver",
+        )
+
+    # Decrement pool (consumed on use, one triple per mul node per eval)
+    _beaver_pool_remaining[pid] = remaining - 1
 
     # ---------- Beaver-aware path ----------
     return await _eval_beaver(pid, request_id, req, input_shares_per_custodian, n, k, mul_nodes)
@@ -428,6 +462,80 @@ async def _eval_beaver(
         },
     )
     return {"result": result, "request_id": request_id}
+
+
+class ReplenishRequest(BaseModel):
+    program_id: str
+    pool_size: int = DEFAULT_BEAVER_POOL_SIZE
+
+
+@app.post("/replenish_beaver")
+async def replenish_beaver(req: ReplenishRequest):
+    """Generate and distribute fresh Beaver triples for an installed program.
+
+    This is used when the original pool has been exhausted by evaluations.
+    The new triples are *appended* to each custodian's pool.
+    """
+    pid = req.program_id
+    if pid not in _packages:
+        raise HTTPException(404, "Program not installed")
+
+    mul_nodes = _find_mul_nodes(_packages[pid]["ir"])
+    if not mul_nodes:
+        return {"status": "no_mul_nodes", "program_id": pid}
+
+    n = NUM_CUSTODIANS
+    k = THRESHOLD
+    triples = generate_triples_for_program(mul_nodes, n, k, req.pool_size)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for idx in range(n):
+            custodian_triples: Dict[str, List[Dict[str, List[int]]]] = {}
+            for node_id, triple_list in triples.items():
+                custodian_triples[node_id] = []
+                for triple_shares in triple_list:
+                    cs = triple_shares.for_custodian(idx)
+                    custodian_triples[node_id].append({
+                        "a": list(cs["a"]),
+                        "b": list(cs["b"]),
+                        "c": list(cs["c"]),
+                    })
+            try:
+                url = f"{CUSTODIAN_URLS[idx]}/install_beaver"
+                resp = await client.post(url, json={
+                    "program_id": pid,
+                    "triple_shares": custodian_triples,
+                })
+                resp.raise_for_status()
+            except Exception:
+                pass
+
+    _beaver_pool_remaining[pid] = _beaver_pool_remaining.get(pid, 0) + req.pool_size
+    _beaver_ready[pid] = True
+
+    _audit.append("replenish_beaver", {
+        "program_id": pid,
+        "pool_size": req.pool_size,
+        "total_remaining": _beaver_pool_remaining[pid],
+    })
+
+    return {
+        "status": "replenished",
+        "program_id": pid,
+        "pool_remaining": _beaver_pool_remaining[pid],
+    }
+
+
+@app.get("/beaver_pool/{program_id}")
+async def beaver_pool_status(program_id: str):
+    """Check remaining Beaver triple pool capacity for a program."""
+    if program_id not in _packages:
+        raise HTTPException(404, "Program not installed")
+    return {
+        "program_id": program_id,
+        "pool_remaining": _beaver_pool_remaining.get(program_id, 0),
+        "beaver_ready": _beaver_ready.get(program_id, False),
+    }
 
 
 @app.get("/audit")

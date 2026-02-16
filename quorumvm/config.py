@@ -10,6 +10,9 @@ PRIME = 2**127 - 1  # Mersenne prime M127
 NUM_CUSTODIANS = 3   # N
 THRESHOLD = 2        # K  (need >= K shares to reconstruct)
 
+# ---------- Beaver triple pool ----------
+DEFAULT_BEAVER_POOL_SIZE = 5   # triples per mul node, consumed one per eval
+
 # ---------- Custodian network (used by coordinator) ----------
 # In K8s the service DNS is  <svc>.<namespace>.svc.cluster.local
 # Env var CUSTODIAN_URL_PREFIX overrides the base; default works for

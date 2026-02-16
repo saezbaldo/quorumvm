@@ -1,6 +1,6 @@
 # QuorumVM — Extraction-Resistant Computation via Threshold Execution
 
-[![Tests](https://img.shields.io/badge/tests-84%2F84%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-108%2F108%20passing-brightgreen)](#test-results)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](#quick-start)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
@@ -8,7 +8,7 @@
 
 QuorumVM is a runtime where programs are executed through **K-of-N threshold participation** of independent custodians. Secret parameters are Shamir-shared — no single machine ever holds full authority to execute or reconstruct the program. An integrated **oracle control plane** governs query budgets, rate limits, and provides an immutable audit trail.
 
-This is a working MVP with **84 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster.
+This is a working MVP with **108 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** — no custodian ever sees plain input values or intermediate products.
 
 ---
 
@@ -52,8 +52,10 @@ QuorumVM protects **parametric functions** — computations where the value lies
 │       │     ──→ Custodian 2 (share of S_v)         │
 │       │                                             │
 │       ├── Policy check (budget, rate limit)         │
+│       ├── Shamir-share inputs across custodians     │
 │       ├── Fan-out to custodians                     │
-│       ├── Collect ≥ K results                       │
+│       ├── Beaver protocol for mul nodes (2 rounds)  │
+│       ├── Reconstruct output from ≥ K shares        │
 │       ├── Audit log (hash-chained)                  │
 │       └── Return result                             │
 └─────────────────────────────────────────────────────┘
@@ -97,7 +99,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements.txt
-pytest tests/ -v          # 84 tests, no Docker needed
+pytest tests/ -v          # 108 tests, no Docker needed
 ```
 
 ### Run the Demo
@@ -109,9 +111,9 @@ python -m quorumvm.demo.run_demo
 The demo:
 1. Compiles `f(x) = (x+7)²` to IR
 2. Builds a versioned Program Package with SHA-256 content addressing
-3. Generates Shamir shares of secret S_v and distributes to custodians
+3. Generates Shamir shares of secret S_v, distributes to custodians, and pre-generates Beaver triples for all `mul` nodes
 4. Collects K-of-N approval signatures and activates the program
-5. Evaluates `f(3)=100`, `f(10)=289`, `f(0)=49` — verifies correctness
+5. Evaluates `f(3)=100`, `f(10)=289`, `f(0)=49` — inputs are Shamir-shared, mul is done via Beaver protocol
 6. Exhausts the per-identity budget → HTTP 429
 7. Triggers rate limiting → HTTP 429
 8. Dumps the hash-chained audit log and verifies integrity
@@ -141,9 +143,9 @@ The demo:
 | Component | Purpose |
 |---|---|
 | **Compiler** (`compiler/`) | Parses the restricted DSL into a DAG-based IR; builds versioned Program Packages with SHA-256 content addressing |
-| **Crypto** (`crypto/`) | Prime-field arithmetic (F_p, p = 2¹²⁷−1), Shamir K-of-N secret sharing, HMAC-SHA256 signatures |
+| **Crypto** (`crypto/`) | Prime-field arithmetic (F_p, p = 2¹²⁷−1), Shamir K-of-N secret sharing, HMAC-SHA256 signatures, Beaver triple generation & sharing |
 | **Coordinator** (`coordinator/`) | Orchestrates version activation (K approvals), evaluation fan-out, policy enforcement, audit logging |
-| **Custodian** (`custodian/`) | Holds secret shares, evaluates IR on share values, signs program approvals |
+| **Custodian** (`custodian/`) | Holds secret shares + Beaver triple shares, evaluates IR with step-by-step mul protocol, signs program approvals |
 
 ---
 
@@ -183,10 +185,22 @@ The DSL is just one frontend. The platform consumes **IR JSON** — you can gene
 | # | Invariant | Implementation |
 |---|---|---|
 | 4.1 | **No single point of authority** | Executing requires K-of-N custodian participation |
-| 4.2 | **No single point of knowledge** | Secrets are Shamir-shared; no custodian holds them fully |
+| 4.2 | **No single point of knowledge** | Secrets are Shamir-shared; inputs Shamir-shared at eval time; mul via Beaver triples |
 | 4.3 | **Oracle access is governed** | Per-identity budgets, token-bucket rate limiting, immutable audit |
 | 4.4 | **Version activation is governed** | New versions require ≥ K custodian HMAC approval signatures |
 | 4.5 | **Graceful degradation** | Compromise impact scales with number of custodians compromised |
+
+### Beaver Triple Protocol (Secure Multiplication)
+
+Multiplying Shamir shares naively produces degree-2K polynomials that break the threshold scheme. QuorumVM solves this with the Beaver triple protocol:
+
+1. **Install phase**: Coordinator generates random triples (a, b, c) where c = a·b mod p, Shamir-shares them, and distributes shares to custodians alongside the program IR.
+2. **Eval Round 1**: Each custodian evaluates the DAG until hitting a `mul` node. It masks its input shares using its Beaver shares: εᵢ = x_share − aᵢ, δᵢ = y_share − bᵢ, and sends these to the coordinator. Execution pauses.
+3. **Coordinator reconstructs**: Collects ≥ K masked-diff shares, Lagrange-reconstructs ε = x − a and δ = y − b. These reveal nothing about x or y (masked by random a, b).
+4. **Eval Round 2**: Coordinator sends (ε, δ) back. Each custodian computes its output share: zᵢ = cᵢ + ε·bᵢ + δ·aᵢ.
+5. **Finalize**: Coordinator Lagrange-reconstructs z from ≥ K shares and adds ε·δ to get the final product x·y.
+
+**Key invariant**: No single party ever sees the raw inputs x or y. The coordinator sees only the masked differences ε, δ.
 
 ### Threat Model
 
@@ -221,6 +235,8 @@ The DSL is just one frontend. The platform consumes **IR JSON** — you can gene
 | `POST` | `/approve` | Submit a custodian approval signature |
 | `GET` | `/status/{program_id}` | Check program activation status (PENDING / ACTIVE) |
 | `POST` | `/eval` | Evaluate a program: `{ identity_id, program_id, inputs: {x: int} }` |
+| `POST` | `/replenish_beaver` | Replenish Beaver triple pool for a program |
+| `GET` | `/beaver_pool/{id}` | Check remaining Beaver triple pool capacity |
 | `GET` | `/audit` | Retrieve the full audit log with chain validity |
 
 ### Custodian
@@ -229,7 +245,10 @@ The DSL is just one frontend. The platform consumes **IR JSON** — you can gene
 |---|---|---|
 | `POST` | `/install` | Install package + secret share |
 | `POST` | `/approve` | Sign a program_id with HMAC key |
-| `POST` | `/eval_share` | Evaluate IR on input shares, return output |
+| `POST` | `/eval_share` | Evaluate IR on input shares, return output (legacy) |
+| `POST` | `/install_beaver` | Install Beaver triple shares for mul nodes |
+| `POST` | `/eval_beaver` | Beaver-aware step-by-step evaluation |
+| `POST` | `/beaver_round2` | Receive reconstructed (ε, δ) and continue eval |
 | `GET` | `/health` | Health check |
 
 ### Example: Calling from Any Language
@@ -248,7 +267,7 @@ curl -X POST http://coordinator:8000/eval \
 
 ## Test Results
 
-### Local Tests (71 passing)
+### Local Tests (95 passing)
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -261,6 +280,8 @@ curl -X POST http://coordinator:8000/eval \
 | `test_policy.py` | 3 | Budget exhaustion, identity isolation, unregistered programs |
 | `test_audit.py` | 3 | Append/verify, empty chain, hash linking |
 | `test_e2e.py` | 5 | Full integration: install → activate → eval → budget → audit |
+| `test_beaver.py` | 25 | **Beaver triples**: generation, sharing, pool (pool_size param), protocol correctness (zero/one/large/commutative/associative), StepExecutor pause/resume, full E2E HTTP |
+| | 5 | **Beaver pool**: multiple evals, exhaustion (409), replenishment, pool status endpoint, distinct triples per eval |
 
 ### Whitepaper Compliance Tests (20 passing locally)
 
@@ -348,14 +369,15 @@ quorumvm/
 ├── crypto/
 │   ├── field.py               # Prime-field arithmetic (F_p)
 │   ├── shamir.py              # Shamir K-of-N secret sharing
-│   └── signatures.py          # HMAC-SHA256 per-custodian signatures
+│   ├── signatures.py          # HMAC-SHA256 per-custodian signatures
+│   └── beaver.py              # Beaver triple generation & protocol
 ├── coordinator/
 │   ├── app.py                 # Coordinator FastAPI app
 │   ├── policy.py              # Budget & token-bucket rate limiter
 │   └── audit.py               # Hash-chained immutable audit log
 ├── custodian/
 │   ├── app.py                 # Custodian FastAPI app (factory pattern)
-│   └── executor.py            # DAG executor on share values
+│   └── executor.py            # DAG executor (StepExecutor with Beaver pause/resume)
 └── demo/
     └── run_demo.py            # End-to-end demo script
 
@@ -369,6 +391,7 @@ tests/
 ├── test_policy.py             # Policy engine
 ├── test_audit.py              # Audit log
 ├── test_e2e.py                # Integration (in-process)
+├── test_beaver.py             # Beaver triple protocol (18 tests)
 ├── test_whitepaper_compliance.py  # Whitepaper invariant tests (local)
 └── test_whitepaper_cluster.py     # Distributed cluster tests (GKE)
 

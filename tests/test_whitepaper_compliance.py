@@ -48,6 +48,7 @@ def _fresh_env():
     coord_module._status.clear()
     coord_module._beaver_ready.clear()
     coord_module._beaver_epsilons.clear()
+    coord_module._beaver_pool_remaining.clear()
     coord_module._policy = PolicyEngine()
     coord_module._audit = coord_module.AuditLog()
 
@@ -140,7 +141,7 @@ def _mock_custodian_eval(custodian_clients, pkg):
             if f"custodian-{i}" not in url:
                 continue
             # Determine which endpoint is being called
-            for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver"):
+            for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver", "/replenish_beaver"):
                 if endpoint in url:
                     resp = cc.post(endpoint, json=json)
 
