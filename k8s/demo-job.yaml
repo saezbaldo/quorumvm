@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quorumvm-demo
+  namespace: quorumvm
+  labels:
+    app: quorumvm-demo
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: quorumvm-demo
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: demo
+          image: gcr.io/car-dealer-ai-472618/quorumvm:latest
+          command:
+            - python
+            - -m
+            - quorumvm.demo.run_demo
+          env:
+            - name: PYTHONPATH
+              value: /app
+            - name: QUORUMVM_COORDINATOR_URL
+              value: "http://coordinator.quorumvm.svc.cluster.local:8000"
+            - name: QUORUMVM_CUSTODIAN_0_URL
+              value: "http://custodian-0.quorumvm.svc.cluster.local:9100"
+            - name: QUORUMVM_CUSTODIAN_1_URL
+              value: "http://custodian-1.quorumvm.svc.cluster.local:9101"
+            - name: QUORUMVM_CUSTODIAN_2_URL
+              value: "http://custodian-2.quorumvm.svc.cluster.local:9102"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

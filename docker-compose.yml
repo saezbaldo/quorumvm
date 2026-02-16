@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  coordinator:
+    build: .
+    command: uvicorn quorumvm.coordinator.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - custodian-0
+      - custodian-1
+      - custodian-2
+
+  custodian-0:
+    build: .
+    command: uvicorn quorumvm.custodian.app:create_app --factory --host 0.0.0.0 --port 9100
+    ports:
+      - "9100:9100"
+    environment:
+      - CUSTODIAN_INDEX=0
+      - CUSTODIAN_PORT=9100
+      - PYTHONPATH=/app
+
+  custodian-1:
+    build: .
+    command: uvicorn quorumvm.custodian.app:create_app --factory --host 0.0.0.0 --port 9101
+    ports:
+      - "9101:9101"
+    environment:
+      - CUSTODIAN_INDEX=1
+      - CUSTODIAN_PORT=9101
+      - PYTHONPATH=/app
+
+  custodian-2:
+    build: .
+    command: uvicorn quorumvm.custodian.app:create_app --factory --host 0.0.0.0 --port 9102
+    ports:
+      - "9102:9102"
+    environment:
+      - CUSTODIAN_INDEX=2
+      - CUSTODIAN_PORT=9102
+      - PYTHONPATH=/app

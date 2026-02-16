@@ -1,0 +1,221 @@
+##############################################################################
+# Custodian 0
+##############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custodian-0
+  namespace: quorumvm
+  labels:
+    app: custodian
+    instance: "0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custodian
+      instance: "0"
+  template:
+    metadata:
+      labels:
+        app: custodian
+        instance: "0"
+    spec:
+      containers:
+        - name: custodian
+          image: gcr.io/car-dealer-ai-472618/quorumvm:latest
+          command: ["uvicorn", "quorumvm.custodian.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "9100"]
+          ports:
+            - containerPort: 9100
+          env:
+            - name: CUSTODIAN_INDEX
+              value: "0"
+            - name: CUSTODIAN_PORT
+              value: "9100"
+            - name: PYTHONPATH
+              value: /app
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9100
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custodian-0
+  namespace: quorumvm
+  labels:
+    app: custodian
+    instance: "0"
+spec:
+  selector:
+    app: custodian
+    instance: "0"
+  ports:
+    - port: 9100
+      targetPort: 9100
+      protocol: TCP
+  type: ClusterIP
+---
+##############################################################################
+# Custodian 1
+##############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custodian-1
+  namespace: quorumvm
+  labels:
+    app: custodian
+    instance: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custodian
+      instance: "1"
+  template:
+    metadata:
+      labels:
+        app: custodian
+        instance: "1"
+    spec:
+      containers:
+        - name: custodian
+          image: gcr.io/car-dealer-ai-472618/quorumvm:latest
+          command: ["uvicorn", "quorumvm.custodian.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "9101"]
+          ports:
+            - containerPort: 9101
+          env:
+            - name: CUSTODIAN_INDEX
+              value: "1"
+            - name: CUSTODIAN_PORT
+              value: "9101"
+            - name: PYTHONPATH
+              value: /app
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9101
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9101
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custodian-1
+  namespace: quorumvm
+  labels:
+    app: custodian
+    instance: "1"
+spec:
+  selector:
+    app: custodian
+    instance: "1"
+  ports:
+    - port: 9101
+      targetPort: 9101
+      protocol: TCP
+  type: ClusterIP
+---
+##############################################################################
+# Custodian 2
+##############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custodian-2
+  namespace: quorumvm
+  labels:
+    app: custodian
+    instance: "2"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custodian
+      instance: "2"
+  template:
+    metadata:
+      labels:
+        app: custodian
+        instance: "2"
+    spec:
+      containers:
+        - name: custodian
+          image: gcr.io/car-dealer-ai-472618/quorumvm:latest
+          command: ["uvicorn", "quorumvm.custodian.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "9102"]
+          ports:
+            - containerPort: 9102
+          env:
+            - name: CUSTODIAN_INDEX
+              value: "2"
+            - name: CUSTODIAN_PORT
+              value: "9102"
+            - name: PYTHONPATH
+              value: /app
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custodian-2
+  namespace: quorumvm
+  labels:
+    app: custodian
+    instance: "2"
+spec:
+  selector:
+    app: custodian
+    instance: "2"
+  ports:
+    - port: 9102
+      targetPort: 9102
+      protocol: TCP
+  type: ClusterIP

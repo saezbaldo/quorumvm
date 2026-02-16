@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  namespace: quorumvm
+  labels:
+    app: coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coordinator
+  template:
+    metadata:
+      labels:
+        app: coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: gcr.io/car-dealer-ai-472618/quorumvm:latest
+          command: ["uvicorn", "quorumvm.coordinator.app:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONPATH
+              value: /app
+            - name: CUSTODIAN_URL_PREFIX
+              value: ".quorumvm.svc.cluster.local"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /audit
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /audit
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: quorumvm
+  labels:
+    app: coordinator
+spec:
+  selector:
+    app: coordinator
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP

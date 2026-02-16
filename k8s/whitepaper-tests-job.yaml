@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quorumvm-whitepaper-tests
+  namespace: quorumvm
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: tests
+          image: gcr.io/car-dealer-ai-472618/quorumvm:latest
+          imagePullPolicy: Always
+          command: ["python", "-m", "tests.test_whitepaper_cluster"]
+          env:
+            - name: QUORUMVM_COORDINATOR_URL
+              value: "http://coordinator.quorumvm.svc.cluster.local:8000"
+            - name: QUORUMVM_CUSTODIAN_0_URL
+              value: "http://custodian-0.quorumvm.svc.cluster.local:9100"
+            - name: QUORUMVM_CUSTODIAN_1_URL
+              value: "http://custodian-1.quorumvm.svc.cluster.local:9101"
+            - name: QUORUMVM_CUSTODIAN_2_URL
+              value: "http://custodian-2.quorumvm.svc.cluster.local:9102"

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quorumvm
+  labels:
+    project: quorumvm
+    part-of: plan-b
