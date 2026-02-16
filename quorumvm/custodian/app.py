@@ -4,24 +4,34 @@ Each custodian instance holds:
 - its index (from env var CUSTODIAN_INDEX)
 - installed program packages
 - Shamir shares of secrets (S_v) for each program
+- Beaver triple shares for secure multiplication
 
 Endpoints:
-- POST /install   – receive program package + share of S_v
-- POST /approve   – sign program_id with HMAC key
-- POST /eval_share – evaluate IR on input shares, return output share
+- POST /install         – receive program package + share of S_v
+- POST /install_beaver  – receive Beaver triple shares for a program
+- POST /approve         – sign program_id with HMAC key
+- POST /eval_share      – evaluate IR on input shares, return output share
+- POST /beaver_round1   – Beaver protocol Round 1: return masked diffs
+- POST /beaver_round2   – Beaver protocol Round 2: compute result shares
+- POST /eval_beaver     – full Beaver-aware step-by-step evaluation
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from quorumvm.config import NUM_CUSTODIANS, THRESHOLD
 from quorumvm.crypto import shamir, signatures
-from quorumvm.custodian.executor import evaluate_ir
+from quorumvm.custodian.executor import (
+    MulRequest,
+    MulResolution,
+    StepExecutor,
+    evaluate_ir,
+)
 
 # ------ request models (module-level for Pydantic / FastAPI compat) ------
 
@@ -42,6 +52,30 @@ class CustodianEvalShareRequest(BaseModel):
     input_shares: Dict[str, Any]  # var_name -> {x, y}
 
 
+class BeaverInstallRequest(BaseModel):
+    """Install Beaver triple shares for a program."""
+
+    program_id: str
+    # node_id -> {"a": [x, y], "b": [x, y], "c": [x, y]}
+    triple_shares: Dict[str, Dict[str, List[int]]]
+
+
+class BeaverEvalRequest(BaseModel):
+    """Full Beaver-aware evaluation request."""
+
+    program_id: str
+    request_id: str
+    input_shares: Dict[str, Any]  # var_name -> {x, y}
+
+
+class BeaverRound2Request(BaseModel):
+    """Beaver Round 2: coordinator sends back reconstructed ε, δ."""
+
+    program_id: str
+    request_id: str
+    resolutions: List[Dict[str, Any]]  # [{node_id, epsilon, delta}, ...]
+
+
 class CustodianState:
     """Per-custodian mutable state."""
 
@@ -49,6 +83,10 @@ class CustodianState:
         self.index = index
         self.installed: Dict[str, dict] = {}
         self.secret_shares: Dict[str, tuple] = {}
+        # program_id -> {node_id: {"a": (x,y), "b": (x,y), "c": (x,y)}}
+        self.beaver_shares: Dict[str, Dict[str, Dict[str, Tuple[int, int]]]] = {}
+        # request_id -> StepExecutor (for multi-round eval)
+        self._executors: Dict[str, StepExecutor] = {}
 
 
 def create_app(state: CustodianState | None = None) -> FastAPI:
@@ -69,6 +107,24 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
         state.secret_shares[pid] = (int(req.share_x), int(req.share_y))
         return {"status": "installed", "custodian": state.index}
 
+    @app.post("/install_beaver")
+    async def install_beaver(req: BeaverInstallRequest):
+        """Install Beaver triple shares for a program's mul nodes."""
+        pid = req.program_id
+        parsed: Dict[str, Dict[str, Tuple[int, int]]] = {}
+        for node_id, shares in req.triple_shares.items():
+            parsed[node_id] = {
+                "a": (int(shares["a"][0]), int(shares["a"][1])),
+                "b": (int(shares["b"][0]), int(shares["b"][1])),
+                "c": (int(shares["c"][0]), int(shares["c"][1])),
+            }
+        state.beaver_shares[pid] = parsed
+        return {
+            "status": "beaver_installed",
+            "custodian": state.index,
+            "mul_nodes": len(parsed),
+        }
+
     @app.post("/approve")
     async def approve(req: CustodianApproveRequest):
         sig = signatures.sign(state.index, req.program_id)
@@ -80,25 +136,126 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
 
     @app.post("/eval_share")
     async def eval_share(req: CustodianEvalShareRequest):
+        """Legacy evaluation: plain values, no Beaver protocol."""
         pid = req.program_id
         if pid not in state.installed:
             raise HTTPException(404, "Program not installed on this custodian")
 
         ir = state.installed[pid]["ir"]
 
-        # Build scalar input-share values for the executor
         input_share_vals: Dict[str, int] = {}
         for var_name, point in req.input_shares.items():
             input_share_vals[var_name] = int(str(point["y"]))
 
-        # For constants, executor falls back to raw value (public constant)
         const_shares: Dict[str, int] = {}
 
         output_val = evaluate_ir(ir, input_share_vals, const_shares)
 
-        # Return the share with the same x-coordinate as the input shares
         x = state.index + 1  # shares use x = 1..N
         return {"x": x, "y": str(output_val), "request_id": req.request_id}
+
+    @app.post("/eval_beaver")
+    async def eval_beaver(req: BeaverEvalRequest):
+        """Beaver-aware evaluation: Step through the DAG, pausing at mul nodes.
+
+        Returns either:
+        - {"status": "mul_pending", "mul_requests": [...]}  if muls need resolution
+        - {"status": "done", "x": ..., "y": ...}            if complete
+        """
+        pid = req.program_id
+        if pid not in state.installed:
+            raise HTTPException(404, "Program not installed on this custodian")
+
+        ir = state.installed[pid]["ir"]
+
+        # Build input shares
+        input_share_vals: Dict[str, int] = {}
+        for var_name, point in req.input_shares.items():
+            input_share_vals[var_name] = int(str(point["y"]))
+
+        const_shares: Dict[str, int] = {}
+
+        # Get Beaver shares for this program
+        beaver = state.beaver_shares.get(pid, {})
+
+        executor = StepExecutor(ir, input_share_vals, const_shares, beaver)
+        state._executors[req.request_id] = executor
+
+        # Step through the DAG
+        mul_reqs = executor.step()
+
+        if mul_reqs:
+            return {
+                "status": "mul_pending",
+                "mul_requests": [
+                    {
+                        "node_id": mr.node_id,
+                        "epsilon_share": str(mr.epsilon_share),
+                        "delta_share": str(mr.delta_share),
+                    }
+                    for mr in mul_reqs
+                ],
+                "request_id": req.request_id,
+            }
+
+        # No muls or DAG completed
+        x = state.index + 1
+        return {
+            "status": "done",
+            "x": x,
+            "y": str(executor.output()),
+            "request_id": req.request_id,
+        }
+
+    @app.post("/beaver_round2")
+    async def beaver_round2(req: BeaverRound2Request):
+        """Beaver Round 2: receive (ε, δ) from coordinator, compute result shares.
+
+        Then continue stepping through the DAG until another mul or done.
+        """
+        executor = state._executors.get(req.request_id)
+        if executor is None:
+            raise HTTPException(404, "No active executor for this request_id")
+
+        # Apply resolutions
+        resolutions = [
+            MulResolution(
+                node_id=r["node_id"],
+                epsilon=int(str(r["epsilon"])),
+                delta=int(str(r["delta"])),
+            )
+            for r in req.resolutions
+        ]
+        executor.resolve_muls(resolutions)
+
+        # Continue stepping
+        mul_reqs = executor.step()
+
+        if mul_reqs:
+            return {
+                "status": "mul_pending",
+                "mul_requests": [
+                    {
+                        "node_id": mr.node_id,
+                        "epsilon_share": str(mr.epsilon_share),
+                        "delta_share": str(mr.delta_share),
+                    }
+                    for mr in mul_reqs
+                ],
+                "request_id": req.request_id,
+            }
+
+        # DAG completed
+        x = state.index + 1
+        output = executor.output()
+        # Clean up
+        del state._executors[req.request_id]
+        return {
+            "status": "done",
+            "x": x,
+            "y": str(output),
+            "request_id": req.request_id,
+        }
 
     @app.get("/health")
     async def health():

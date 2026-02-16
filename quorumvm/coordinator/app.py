@@ -2,23 +2,34 @@
 
 The coordinator orchestrates:
 - version activation (collect K approvals)
-- evaluation (split inputs → custodians → reconstruct output)
+- evaluation with Beaver-triple-based secure multiplication
 - policy enforcement & audit logging
+
+Evaluation flow (Beaver-aware):
+1. Shamir-share each input across N custodians.
+2. Send shares to custodians via /eval_beaver.
+3. If a custodian reports ``mul_pending``, collect the masked (ε, δ)
+   shares from all custodians, reconstruct ε and δ via Lagrange, then
+   send them back via /beaver_round2.
+4. Repeat until all custodians report ``done``.
+5. Reconstruct the final output from K-of-N output shares.
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from quorumvm.config import CUSTODIAN_URLS, NUM_CUSTODIANS, THRESHOLD
+from quorumvm.config import CUSTODIAN_URLS, NUM_CUSTODIANS, PRIME, THRESHOLD
 from quorumvm.coordinator.audit import AuditLog
 from quorumvm.coordinator.policy import PolicyEngine
 from quorumvm.crypto import shamir, signatures
+from quorumvm.crypto.beaver import coordinator_finalize, generate_triples_for_program
+from quorumvm.crypto import field
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -36,6 +47,10 @@ _packages: Dict[str, dict] = {}
 _approvals: Dict[str, List[tuple]] = {}
 # program_id -> "PENDING" | "ACTIVE"
 _status: Dict[str, str] = {}
+# program_id -> True if Beaver triples have been distributed
+_beaver_ready: Dict[str, bool] = {}
+# program_id -> {node_id: {epsilon: int, delta: int}} (cached per eval)
+_beaver_epsilons: Dict[str, Dict[str, Dict[str, int]]] = {}
 
 _policy = PolicyEngine()
 _audit = AuditLog()
@@ -47,6 +62,8 @@ _audit = AuditLog()
 
 class InstallRequest(BaseModel):
     program_package: Dict[str, Any]
+    # Optional: pre-generate Beaver triples during install
+    generate_beaver: bool = True
 
 
 class ApproveRequest(BaseModel):
@@ -67,13 +84,22 @@ class AuditResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Helper: find mul nodes in IR
+# ---------------------------------------------------------------------------
+
+def _find_mul_nodes(ir: dict) -> List[str]:
+    """Return the IDs of all ``mul`` nodes in the IR."""
+    return [n["id"] for n in ir["nodes"] if n["type"] == "mul"]
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 
 @app.post("/install")
 async def install(req: InstallRequest):
-    """Install a program package on the coordinator."""
+    """Install a program package on the coordinator and distribute Beaver triples."""
     pkg = req.program_package
     pid = pkg["program_id"]
     _packages[pid] = pkg
@@ -81,7 +107,42 @@ async def install(req: InstallRequest):
     _status[pid] = "PENDING"
     _policy.register(pid, pkg.get("policy_manifest", {}))
     _audit.append("install", {"program_id": pid, "version": pkg.get("version")})
-    return {"status": "installed", "program_id": pid}
+
+    # Generate and distribute Beaver triples for mul nodes
+    mul_nodes = _find_mul_nodes(pkg["ir"])
+    if mul_nodes and req.generate_beaver:
+        n = NUM_CUSTODIANS
+        k = THRESHOLD
+        triples = generate_triples_for_program(mul_nodes, n, k)
+
+        # Distribute to each custodian
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for idx in range(n):
+                # Build the triple shares for this custodian
+                custodian_triples: Dict[str, Dict[str, List[int]]] = {}
+                for node_id, triple_shares in triples.items():
+                    cs = triple_shares.for_custodian(idx)
+                    custodian_triples[node_id] = {
+                        "a": list(cs["a"]),
+                        "b": list(cs["b"]),
+                        "c": list(cs["c"]),
+                    }
+
+                try:
+                    url = f"{CUSTODIAN_URLS[idx]}/install_beaver"
+                    resp = await client.post(url, json={
+                        "program_id": pid,
+                        "triple_shares": custodian_triples,
+                    })
+                    resp.raise_for_status()
+                except Exception:
+                    pass  # Will fail at eval time if too few custodians
+
+        _beaver_ready[pid] = True
+    else:
+        _beaver_ready[pid] = len(mul_nodes) == 0  # No muls = ready
+
+    return {"status": "installed", "program_id": pid, "beaver_ready": _beaver_ready[pid]}
 
 
 @app.post("/approve")
@@ -120,7 +181,12 @@ async def status(program_id: str):
 
 @app.post("/eval")
 async def evaluate(req: EvalRequest):
-    """Evaluate a program on given inputs (threshold-split execution)."""
+    """Evaluate a program on given inputs using Beaver-triple secure multiplication.
+
+    The inputs are Shamir-shared across custodians.  No custodian sees the
+    plain input values.  Multiplications are resolved via the interactive
+    Beaver protocol.
+    """
     pid = req.program_id
     if pid not in _packages:
         raise HTTPException(404, "Program not installed")
@@ -136,44 +202,66 @@ async def evaluate(req: EvalRequest):
         )
         raise HTTPException(429, denial)
 
-    # ---- distribute to custodians ----
     request_id = uuid.uuid4().hex
     n = NUM_CUSTODIANS
     k = THRESHOLD
 
-    # MVP: send the full input values to each custodian.  Each custodian
-    # evaluates the DAG independently and returns the result.  The
-    # coordinator requires >= K consistent answers for the response.
-    # (Shamir-splitting inputs doesn't work for circuits with mul
-    # without Beaver-triple preprocessing, which is out of scope.)
-    input_payload: Dict[str, Any] = {}
+    # ---- Shamir-share each input ----
+    input_shares_per_custodian: Dict[int, Dict[str, Any]] = {
+        idx: {} for idx in range(n)
+    }
     for var_name, value in req.inputs.items():
-        input_payload[var_name] = {"x": 0, "y": str(value)}
+        shares = shamir.share(value, n, k)
+        for idx, (x, y) in enumerate(shares):
+            input_shares_per_custodian[idx][var_name] = {
+                "x": x,
+                "y": str(y),
+            }
 
-    # ---- fan out to custodians ----
-    results: List[int] = []
+    # ---- Check if program has mul nodes (needs Beaver) ----
+    mul_nodes = _find_mul_nodes(_packages[pid]["ir"])
+    use_beaver = len(mul_nodes) > 0 and _beaver_ready.get(pid, False)
+
+    if not use_beaver:
+        # ---------- Legacy path (no muls or no Beaver triples) ----------
+        return await _eval_legacy(pid, request_id, req, input_shares_per_custodian, n, k)
+
+    # ---------- Beaver-aware path ----------
+    return await _eval_beaver(pid, request_id, req, input_shares_per_custodian, n, k, mul_nodes)
+
+
+async def _eval_legacy(
+    pid: str,
+    request_id: str,
+    req: EvalRequest,
+    input_shares_per_custodian: Dict[int, Dict[str, Any]],
+    n: int,
+    k: int,
+) -> dict:
+    """Legacy evaluation: send shared inputs, collect output shares, reconstruct."""
+    output_shares: List[Tuple[int, int]] = []
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         for idx in range(n):
             url = f"{CUSTODIAN_URLS[idx]}/eval_share"
             payload = {
                 "program_id": pid,
                 "request_id": request_id,
-                "input_shares": input_payload,
+                "input_shares": input_shares_per_custodian[idx],
             }
             try:
                 resp = await client.post(url, json=payload)
                 resp.raise_for_status()
                 body = resp.json()
-                results.append(int(str(body["y"])))
+                output_shares.append((int(body["x"]), int(str(body["y"]))))
             except Exception:
-                # Custodian may be down; we continue as long as we gather >= K
                 pass
 
-    if len(results) < k:
-        raise HTTPException(503, f"Only {len(results)}/{k} custodians responded")
+    if len(output_shares) < k:
+        raise HTTPException(503, f"Only {len(output_shares)}/{k} custodians responded")
 
-    # ---- verify consistency (all responding custodians should agree) ----
-    result = results[0]
+    # Reconstruct output via Lagrange interpolation
+    result = shamir.reconstruct(output_shares[:k])
 
     _audit.append(
         "eval_ok",
@@ -182,6 +270,161 @@ async def evaluate(req: EvalRequest):
             "identity_id": req.identity_id,
             "request_id": request_id,
             "result": result,
+            "mode": "legacy",
+        },
+    )
+    return {"result": result, "request_id": request_id}
+
+
+async def _eval_beaver(
+    pid: str,
+    request_id: str,
+    req: EvalRequest,
+    input_shares_per_custodian: Dict[int, Dict[str, Any]],
+    n: int,
+    k: int,
+    mul_nodes: List[str],
+) -> dict:
+    """Beaver-aware evaluation with interactive mul protocol."""
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # ---- Round 0: Start evaluation on all custodians ----
+        responses: Dict[int, dict] = {}
+        for idx in range(n):
+            url = f"{CUSTODIAN_URLS[idx]}/eval_beaver"
+            payload = {
+                "program_id": pid,
+                "request_id": request_id,
+                "input_shares": input_shares_per_custodian[idx],
+            }
+            try:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                responses[idx] = resp.json()
+            except Exception:
+                pass  # custodian down
+
+        if len(responses) < k:
+            raise HTTPException(503, f"Only {len(responses)}/{k} custodians responded")
+
+        # ---- Interactive rounds: resolve mul nodes ----
+        max_rounds = len(mul_nodes) * 2 + 1  # safety limit
+        round_count = 0
+
+        while round_count < max_rounds:
+            round_count += 1
+
+            # Check if any custodian has pending muls
+            pending = {
+                idx: r for idx, r in responses.items()
+                if r.get("status") == "mul_pending"
+            }
+            if not pending:
+                break  # All custodians are done
+
+            # Collect all mul requests from all custodians.
+            # Each custodian reports the same set of node_ids but with
+            # different share values.
+            # Group by node_id → list of (custodian_idx, eps_share, delta_share)
+            mul_data: Dict[str, List[Tuple[int, int, int]]] = {}
+            for idx, r in pending.items():
+                for mr in r.get("mul_requests", []):
+                    nid = mr["node_id"]
+                    if nid not in mul_data:
+                        mul_data[nid] = []
+                    mul_data[nid].append((
+                        idx + 1,  # Shamir x-coordinate (1-based)
+                        int(str(mr["epsilon_share"])),
+                        int(str(mr["delta_share"])),
+                    ))
+
+            # Reconstruct ε and δ for each mul node
+            resolved: Dict[str, Dict[str, int]] = {}
+            for nid, shares_list in mul_data.items():
+                if len(shares_list) < k:
+                    raise HTTPException(
+                        503,
+                        f"Not enough custodians for mul node {nid}: "
+                        f"{len(shares_list)} < {k}",
+                    )
+
+                eps_points = [(x, eps) for x, eps, _ in shares_list[:k]]
+                delta_points = [(x, delta) for x, _, delta in shares_list[:k]]
+
+                epsilon = shamir.reconstruct(eps_points)
+                delta = shamir.reconstruct(delta_points)
+                resolved[nid] = {"epsilon": epsilon, "delta": delta}
+
+            # Send Round 2 to all responding custodians
+            resolutions_payload = [
+                {
+                    "node_id": nid,
+                    "epsilon": str(vals["epsilon"]),
+                    "delta": str(vals["delta"]),
+                }
+                for nid, vals in resolved.items()
+            ]
+
+            new_responses: Dict[int, dict] = {}
+            for idx in pending:
+                url = f"{CUSTODIAN_URLS[idx]}/beaver_round2"
+                payload = {
+                    "program_id": pid,
+                    "request_id": request_id,
+                    "resolutions": resolutions_payload,
+                }
+                try:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    new_responses[idx] = resp.json()
+                except Exception:
+                    pass
+
+            # Merge: keep done responses, update pending ones
+            for idx, r in new_responses.items():
+                responses[idx] = r
+
+            # Store resolved epsilons/deltas for final reconstruction
+            if pid not in _beaver_epsilons:
+                _beaver_epsilons[pid] = {}
+            for nid, vals in resolved.items():
+                _beaver_epsilons[pid][nid] = vals
+
+        # ---- Collect output shares and reconstruct ----
+        output_shares: List[Tuple[int, int]] = []
+        for idx, r in responses.items():
+            if r.get("status") == "done":
+                output_shares.append((int(r["x"]), int(str(r["y"]))))
+
+        if len(output_shares) < k:
+            raise HTTPException(
+                503,
+                f"Only {len(output_shares)}/{k} custodians completed",
+            )
+
+        # Reconstruct the partial result (without ε*δ corrections)
+        z_prime = shamir.reconstruct(output_shares[:k])
+
+        # Apply ε*δ correction for each mul node
+        result = z_prime
+        epsilons = _beaver_epsilons.get(pid, {})
+        for nid in mul_nodes:
+            if nid in epsilons:
+                eps = epsilons[nid]["epsilon"]
+                delta = epsilons[nid]["delta"]
+                result = coordinator_finalize(result, eps, delta)
+
+        # Clean up cached epsilons
+        _beaver_epsilons.pop(pid, None)
+
+    _audit.append(
+        "eval_ok",
+        {
+            "program_id": pid,
+            "identity_id": req.identity_id,
+            "request_id": request_id,
+            "result": result,
+            "mode": "beaver",
         },
     )
     return {"result": result, "request_id": request_id}

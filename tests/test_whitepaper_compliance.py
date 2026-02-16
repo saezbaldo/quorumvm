@@ -46,6 +46,8 @@ def _fresh_env():
     coord_module._packages.clear()
     coord_module._approvals.clear()
     coord_module._status.clear()
+    coord_module._beaver_ready.clear()
+    coord_module._beaver_epsilons.clear()
     coord_module._policy = PolicyEngine()
     coord_module._audit = coord_module.AuditLog()
 
@@ -82,10 +84,26 @@ def _install_on_custodians(custodian_clients, pkg, shares):
         assert resp.status_code == 200
 
 
-def _install_on_coordinator(coordinator, pkg):
-    resp = coordinator.post(
-        "/install", json={"program_package": pkg.model_dump()}
-    )
+def _install_on_coordinator(coordinator, pkg, custodian_clients=None):
+    """Install on coordinator.  If *custodian_clients* are given, also
+    distribute Beaver triples via mocked HTTP."""
+    if custodian_clients is not None:
+        fake_post = _mock_custodian_eval(custodian_clients, pkg)
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_instance = AsyncMock()
+            mock_instance.post = fake_post
+            mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_instance
+            resp = coordinator.post(
+                "/install",
+                json={"program_package": pkg.model_dump(), "generate_beaver": True},
+            )
+    else:
+        resp = coordinator.post(
+            "/install",
+            json={"program_package": pkg.model_dump(), "generate_beaver": False},
+        )
     assert resp.status_code == 200
 
 
@@ -110,25 +128,33 @@ def _approve_k(coordinator, custodian_clients, program_id, k=THRESHOLD):
 
 
 def _mock_custodian_eval(custodian_clients, pkg):
-    """Return an async side-effect for httpx that routes to in-process custodians."""
+    """Return an async side-effect for httpx that routes to in-process custodians.
+
+    Routes ALL custodian endpoints: /eval_share, /eval_beaver,
+    /beaver_round2, /install_beaver.
+    """
 
     async def _fake_post(url: str, *, json: dict, **kw):
         """Route coordinator's outbound HTTP to in-process custodian TestClients."""
         for i, cc in enumerate(custodian_clients):
-            if f"custodian-{i}" in url and "/eval_share" in url:
-                resp = cc.post("/eval_share", json=json)
+            if f"custodian-{i}" not in url:
+                continue
+            # Determine which endpoint is being called
+            for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver"):
+                if endpoint in url:
+                    resp = cc.post(endpoint, json=json)
 
-                class _FakeResp:
-                    status_code = resp.status_code
+                    class _FakeResp:
+                        status_code = resp.status_code
 
-                    def raise_for_status(self):
-                        if self.status_code >= 400:
-                            raise Exception(f"HTTP {self.status_code}")
+                        def raise_for_status(self_inner):
+                            if self_inner.status_code >= 400:
+                                raise Exception(f"HTTP {self_inner.status_code}")
 
-                    def json(self_inner):
-                        return resp.json()
+                        def json(self_inner):
+                            return resp.json()
 
-                return _FakeResp()
+                    return _FakeResp()
         raise Exception(f"No custodian matched URL {url}")
 
     return _fake_post
@@ -348,7 +374,7 @@ class TestBudgetEnforcement:
         shares = shamir.share(42, NUM_CUSTODIANS, THRESHOLD)
 
         _install_on_custodians(custodian_clients, pkg, shares)
-        _install_on_coordinator(coordinator, pkg)
+        _install_on_coordinator(coordinator, pkg, custodian_clients)
         _approve_k(coordinator, custodian_clients, pkg.program_id)
 
         fake_post = _mock_custodian_eval(custodian_clients, pkg)
@@ -432,7 +458,7 @@ class TestRateLimitEnforcement:
         shares = shamir.share(42, NUM_CUSTODIANS, THRESHOLD)
 
         _install_on_custodians(custodian_clients, pkg, shares)
-        _install_on_coordinator(coordinator, pkg)
+        _install_on_coordinator(coordinator, pkg, custodian_clients)
         _approve_k(coordinator, custodian_clients, pkg.program_id)
 
         fake_post = _mock_custodian_eval(custodian_clients, pkg)
@@ -498,7 +524,7 @@ class TestAuditChainIntegrity:
         shares = shamir.share(42, NUM_CUSTODIANS, THRESHOLD)
 
         _install_on_custodians(custodian_clients, pkg, shares)
-        _install_on_coordinator(coordinator, pkg)
+        _install_on_coordinator(coordinator, pkg, custodian_clients)
         _approve_k(coordinator, custodian_clients, pkg.program_id)
 
         fake_post = _mock_custodian_eval(custodian_clients, pkg)
@@ -571,27 +597,30 @@ class TestGracefulDegradation:
         shares = shamir.share(42, NUM_CUSTODIANS, THRESHOLD)
 
         _install_on_custodians(custodian_clients, pkg, shares)
-        _install_on_coordinator(coordinator, pkg)
+        _install_on_coordinator(coordinator, pkg, custodian_clients)
         _approve_k(coordinator, custodian_clients, pkg.program_id)
 
-        # Build a mock that makes custodian-2 unreachable
+        # Build a mock that makes custodian-2 unreachable for eval
         async def _partial_post(url: str, *, json: dict, **kw):
             for i, cc in enumerate(custodian_clients):
-                if f"custodian-{i}" in url and "/eval_share" in url:
-                    if i == NUM_CUSTODIANS - 1:
-                        # Simulate custodian down
-                        raise ConnectionError("custodian unreachable")
-                    resp = cc.post("/eval_share", json=json)
+                if f"custodian-{i}" not in url:
+                    continue
+                # Determine endpoint
+                for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver"):
+                    if endpoint in url:
+                        if i == NUM_CUSTODIANS - 1:
+                            raise ConnectionError("custodian unreachable")
+                        resp = cc.post(endpoint, json=json)
 
-                    class _R:
-                        status_code = resp.status_code
-                        def raise_for_status(self):
-                            if self.status_code >= 400:
-                                raise Exception(f"HTTP {self.status_code}")
-                        def json(self_inner):
-                            return resp.json()
+                        class _R:
+                            status_code = resp.status_code
+                            def raise_for_status(self_inner):
+                                if self_inner.status_code >= 400:
+                                    raise Exception(f"HTTP {self_inner.status_code}")
+                            def json(self_inner):
+                                return resp.json()
 
-                    return _R()
+                        return _R()
             raise Exception(f"Unmatched URL {url}")
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -621,7 +650,7 @@ class TestGracefulDegradation:
         shares = shamir.share(42, NUM_CUSTODIANS, THRESHOLD)
 
         _install_on_custodians(custodian_clients, pkg, shares)
-        _install_on_coordinator(coordinator, pkg)
+        _install_on_coordinator(coordinator, pkg, custodian_clients)
         _approve_k(coordinator, custodian_clients, pkg.program_id)
 
         # Make all but K-1 custodians unreachable (i.e. N-K+1 are down)
@@ -629,20 +658,23 @@ class TestGracefulDegradation:
 
         async def _mostly_dead_post(url: str, *, json: dict, **kw):
             for i, cc in enumerate(custodian_clients):
-                if f"custodian-{i}" in url and "/eval_share" in url:
-                    if i >= alive:
-                        raise ConnectionError("custodian unreachable")
-                    resp = cc.post("/eval_share", json=json)
+                if f"custodian-{i}" not in url:
+                    continue
+                for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver"):
+                    if endpoint in url:
+                        if i >= alive:
+                            raise ConnectionError("custodian unreachable")
+                        resp = cc.post(endpoint, json=json)
 
-                    class _R:
-                        status_code = resp.status_code
-                        def raise_for_status(self):
-                            if self.status_code >= 400:
-                                raise Exception(f"HTTP {self.status_code}")
-                        def json(self_inner):
-                            return resp.json()
+                        class _R:
+                            status_code = resp.status_code
+                            def raise_for_status(self_inner):
+                                if self_inner.status_code >= 400:
+                                    raise Exception(f"HTTP {self_inner.status_code}")
+                            def json(self_inner):
+                                return resp.json()
 
-                    return _R()
+                        return _R()
             raise Exception(f"Unmatched URL {url}")
 
         with patch("httpx.AsyncClient") as MockClient:
@@ -701,8 +733,8 @@ class TestFullWhitepaperFlow:
         # ---- Step 4: Install on custodians ----
         _install_on_custodians(custodian_clients, pkg, shares)
 
-        # ---- Step 5: Install on coordinator ----
-        _install_on_coordinator(coordinator, pkg)
+        # ---- Step 5: Install on coordinator (with Beaver triples) ----
+        _install_on_coordinator(coordinator, pkg, custodian_clients)
 
         # Verify PENDING
         resp = coordinator.get(f"/status/{pkg.program_id}")

@@ -1,33 +1,230 @@
-"""DAG executor operating on Shamir shares.
+"""DAG executor operating on Shamir shares with Beaver triple support.
 
 The executor evaluates the IR node-by-node.  Because Shamir shares are
 points on polynomials over F_p, **addition and subtraction of shares are
-linear** and work directly.  Multiplication of two degree-(k-1)
-polynomials would normally produce a degree-2(k-1) polynomial, which
-breaks the threshold property.
+linear** and work directly on shares.
 
-For the MVP we use a simplification: the custodian evaluates the circuit
-*locally on its share values* (treating them as field elements).  This
-is correct when the coordinator collects outputs from ≥ K custodians and
-reconstructs via Lagrange – **provided every operation is a linear
-combination of the secret-shared inputs and publicly-known constants**.
+**Multiplication** of two secret-shared values uses the **Beaver triple
+protocol** — a two-round interactive procedure between custodians and the
+coordinator.  The executor supports two modes:
 
-For multiplications between two secret-shared values, the MVP coordinator
-falls back to sharing the product at the coordinator level (the inputs
-in the demo are sent in the clear to the coordinator anyway).  A
-production system would use Beaver triples or degree-reduction; that is
-out of scope for this MVP.
+1. **Full-DAG evaluation** (``evaluate_ir``): evaluates the entire DAG
+   in one pass, suitable for programs with only linear ops or for
+   backward-compatible plain-value evaluation.
 
-The executor therefore evaluates the full DAG on scalar share values,
-which is sufficient for demonstrating threshold execution, policy
-enforcement, and the activation workflow.
+2. **Step-by-step evaluation** (``StepExecutor``): evaluates the DAG
+   node-by-node.  When it encounters a ``mul`` node it **pauses** and
+   emits a ``MulRequest`` that the coordinator uses to orchestrate the
+   Beaver protocol.  After the coordinator resolves the masked values
+   and sends them back, the executor resumes.
+
+The step-by-step mode is used by the Beaver-aware coordinator endpoint
+to achieve true secure multiplication on shares.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from dataclasses import dataclass, field as dc_field
+from typing import Any, Dict, List, Optional, Tuple
 
 from quorumvm.crypto import field
+from quorumvm.crypto.beaver import custodian_mul_round1, custodian_mul_round2
+
+
+# --------------------------------------------------------------------------
+# Data classes for the step-by-step protocol
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class MulRequest:
+    """Emitted by StepExecutor when it hits a ``mul`` node.
+
+    The coordinator collects these from all custodians and runs the
+    Beaver protocol to resolve the multiplication.
+    """
+
+    node_id: str
+    epsilon_share: int  # share of (x - a)
+    delta_share: int    # share of (y - b)
+
+
+@dataclass
+class MulResolution:
+    """Sent by the coordinator back to the custodian after Round 1.
+
+    Contains the publicly-reconstructed masked values ε and δ, plus
+    the custodian's Beaver shares (a_i, b_i, c_i) for Round 2.
+    """
+
+    node_id: str
+    epsilon: int  # reconstructed ε = x - a
+    delta: int    # reconstructed δ = y - b
+
+
+# --------------------------------------------------------------------------
+# Step-by-step executor (Beaver-aware)
+# --------------------------------------------------------------------------
+
+
+class StepExecutor:
+    """Evaluates an IR DAG node-by-node, pausing at ``mul`` nodes.
+
+    Usage::
+
+        exec = StepExecutor(ir, input_shares, const_shares, beaver_shares)
+        while not exec.done:
+            mul_reqs = exec.step()
+            if mul_reqs:
+                # send mul_reqs to coordinator, get resolutions back
+                exec.resolve_muls(resolutions)
+        output = exec.output()
+    """
+
+    def __init__(
+        self,
+        ir: Dict[str, Any],
+        input_shares: Dict[str, int],
+        const_shares: Dict[str, int],
+        beaver_shares: Optional[Dict[str, Dict[str, Tuple[int, int]]]] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        ir : dict
+            The IR dict with ``nodes`` and ``output_node_id``.
+        input_shares : dict
+            var_name → share y-value.
+        const_shares : dict
+            const_node_id → share y-value (or fall back to public).
+        beaver_shares : dict or None
+            mul_node_id → {"a": (x,y), "b": (x,y), "c": (x,y)}.
+            If None, mul falls back to plain multiplication (legacy mode).
+        """
+        self.ir = ir
+        self.wires: Dict[str, int] = {}
+        self.input_shares = input_shares
+        self.const_shares = const_shares
+        self.beaver_shares = beaver_shares or {}
+        self._nodes = list(ir["nodes"])
+        self._cursor = 0
+        self.done = False
+        self._pending_muls: List[str] = []
+
+    def step(self) -> List[MulRequest]:
+        """Evaluate nodes until a ``mul`` is encountered or DAG is done.
+
+        Returns a list of MulRequest objects (one per mul node hit in
+        this step).  If the list is empty, the DAG evaluation is
+        complete.
+        """
+        mul_requests: List[MulRequest] = []
+
+        while self._cursor < len(self._nodes):
+            node = self._nodes[self._cursor]
+            nid = node["id"]
+            ntype = node["type"]
+
+            if ntype == "input":
+                if nid not in self.input_shares:
+                    raise ValueError(f"Missing input share for '{nid}'")
+                self.wires[nid] = self.input_shares[nid]
+                self._cursor += 1
+
+            elif ntype == "const":
+                if nid in self.const_shares:
+                    self.wires[nid] = self.const_shares[nid]
+                else:
+                    self.wires[nid] = field.reduce(node["value"])
+                self._cursor += 1
+
+            elif ntype in ("add", "sub"):
+                a_id, b_id = node["inputs"]
+                a_val, b_val = self.wires[a_id], self.wires[b_id]
+                if ntype == "add":
+                    self.wires[nid] = field.add(a_val, b_val)
+                else:
+                    self.wires[nid] = field.sub(a_val, b_val)
+                self._cursor += 1
+
+            elif ntype == "mul":
+                a_id, b_id = node["inputs"]
+                x_share = self.wires[a_id]
+                y_share = self.wires[b_id]
+
+                if nid in self.beaver_shares:
+                    # --- Beaver Round 1 ---
+                    bshares = self.beaver_shares[nid]
+                    a_y = bshares["a"][1]
+                    b_y = bshares["b"][1]
+                    eps, delta = custodian_mul_round1(
+                        x_share, y_share, a_y, b_y,
+                    )
+                    mul_requests.append(MulRequest(
+                        node_id=nid,
+                        epsilon_share=eps,
+                        delta_share=delta,
+                    ))
+                    self._pending_muls.append(nid)
+                    self._cursor += 1
+                else:
+                    # Legacy fallback: plain multiplication (no Beaver)
+                    self.wires[nid] = field.mul(x_share, y_share)
+                    self._cursor += 1
+            else:
+                raise ValueError(f"Unknown node type '{ntype}'")
+
+            # If we hit mul nodes with Beaver, pause to let coordinator
+            # orchestrate the protocol.  We batch all consecutive muls.
+            if mul_requests:
+                # Look ahead: if the next node is also a mul whose inputs
+                # are already resolved, continue to batch it.
+                if self._cursor < len(self._nodes):
+                    next_node = self._nodes[self._cursor]
+                    if next_node["type"] == "mul":
+                        next_inputs = next_node["inputs"]
+                        if all(i in self.wires for i in next_inputs):
+                            continue  # batch this mul too
+                # Otherwise break and return the batch
+                return mul_requests
+
+        self.done = True
+        return []
+
+    def resolve_muls(self, resolutions: List[MulResolution]) -> None:
+        """Apply Beaver Round-2 results for pending mul nodes.
+
+        Parameters
+        ----------
+        resolutions : list of MulResolution
+            Must be in the same order as the MulRequests returned by step().
+        """
+        for res in resolutions:
+            nid = res.node_id
+            if nid not in self.beaver_shares:
+                raise ValueError(f"No Beaver shares for node '{nid}'")
+            bshares = self.beaver_shares[nid]
+            z_share = custodian_mul_round2(
+                epsilon=res.epsilon,
+                delta=res.delta,
+                a_share_y=bshares["a"][1],
+                b_share_y=bshares["b"][1],
+                c_share_y=bshares["c"][1],
+            )
+            self.wires[nid] = z_share
+        self._pending_muls.clear()
+
+    def output(self) -> int:
+        """Return the output wire value (call after ``done`` is True)."""
+        output_id = self.ir["output_node_id"]
+        if output_id not in self.wires:
+            raise RuntimeError("Output node not yet evaluated")
+        return self.wires[output_id]
+
+
+# --------------------------------------------------------------------------
+# Legacy one-shot evaluator (backward compatible)
+# --------------------------------------------------------------------------
 
 
 def evaluate_ir(
@@ -36,6 +233,11 @@ def evaluate_ir(
     const_shares: Dict[str, int],
 ) -> int:
     """Evaluate the DAG on share values and return the output share.
+
+    This is the legacy one-shot evaluator that does **not** use Beaver
+    triples.  It evaluates ``mul`` as plain field multiplication, which
+    is correct when all custodians receive the same plain inputs (the
+    original MVP behavior).
 
     Parameters
     ----------
@@ -61,7 +263,6 @@ def evaluate_ir(
             if nid in const_shares:
                 wires[nid] = const_shares[nid]
             else:
-                # Fallback: constant is public, use raw value
                 wires[nid] = field.reduce(node["value"])
 
         elif ntype in ("add", "sub", "mul"):
