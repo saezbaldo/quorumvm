@@ -1,6 +1,6 @@
 # QuorumVM — Roadmap
 
-Last updated: **2025-07-15**
+Last updated: **2025-07-16**
 
 ---
 
@@ -51,19 +51,16 @@ Last updated: **2025-07-15**
 - [x] Demo script updated with Beaver pool flow
 - [x] All 108 tests passing (95 local + 13 cluster)
 
----
-
-## 🔧 In Progress
-
 ### Phase 7 — GKE Redeploy with Beaver + Pool
-- [ ] Rebuild Docker image with Beaver + pool code
-- [ ] Push to GCR and rolling-update K8s deployments
-- [ ] Re-run 13 distributed cluster tests → all pass
-- [ ] Update `test_whitepaper_cluster.py` to test Beaver flow on cluster
+- [x] Docker image rebuilt with Beaver + pool code (tags: `latest`, `v3-beaver-pool`)
+- [x] Pushed to GCR (`gcr.io/car-dealer-ai-472618/quorumvm`)
+- [x] Rolling-update of all 4 K8s deployments (coordinator + 3 custodians)
+- [x] Re-ran 13 distributed cluster tests → **13/13 passed ✅**
+- [x] All whitepaper invariants verified on live GKE cluster
 
 ---
 
-## 📋 Planned
+##  Planned
 
 ### Phase 8 — Coordinator Visibility Reduction
 **Problem**: Coordinator currently sees reconstructed (ε, δ) during Beaver rounds. While these are masked and reveal nothing about raw inputs, a malicious coordinator could attempt offline attacks.
@@ -114,5 +111,5 @@ Last updated: **2025-07-15**
 | Beaver pool tests | 5 |
 | Whitepaper compliance (local) | 20 |
 | Distributed cluster (GKE) | 13 |
-| GitHub commits | 3 (pending push) |
-| Open phases | 5 (Phase 7–11) |
+| GitHub commits | 4 |
+| Open phases | 4 (Phase 8–11) |
