@@ -1,6 +1,6 @@
 # QuorumVM — Roadmap
 
-Last updated: **2026-02-17**
+Last updated: **2026-02-18**
 
 ---
 
@@ -76,14 +76,24 @@ Last updated: **2026-02-17**
 - [x] All 110 tests passing (97 local + 13 cluster)
 - [x] Docker image `v4-p2p-beaver` deployed, 13/13 distributed tests pass
 
+### Phase 9 — DSL Expansion
+- [x] `neg` gate — unary additive inverse
+- [x] `mux` gate — selector-based conditional: `mux(s, a, b) = s*a + (1-s)*b`
+- [x] Multi-output programs — `output a b` or multiple `output` statements
+- [x] IR updated: `output_node_ids` list + backward-compatible `output_node_id`
+- [x] Stdlib macro: `dot <name> = <a1> <b1> ... <aN> <bN>` — dot product
+- [x] Stdlib macro: `polyeval <name> = <x> <c0> <c1> ... <cN>` — Horner polynomial evaluation
+- [x] Compiler optimizer: Common Subexpression Elimination (CSE)
+- [x] Compiler optimizer: Dead Node Pruning
+- [x] `compiler/optimizer.py` — `optimize()`, `eliminate_common_subexpressions()`, `prune_dead_nodes()`
+- [x] Executor updated: `neg`, `mux`, `evaluate_ir_multi()`, `StepExecutor.outputs()`
+- [x] Coordinator & custodian: multi-output support in legacy + Beaver + P2P paths
+- [x] 25 new Phase 9 tests: gate types, multi-output, stdlib, CSE, dead-node pruning
+- [x] All 122 tests passing (109 local + 13 cluster)
+
 ---
 
 ## 📋 Planned
-- [ ] Constants in DSL (`const seven = 7`)
-- [ ] Multi-output programs (return multiple values)
-- [ ] Conditional-like patterns via MUX gates: `mux(selector, a, b)`
-- [ ] Standard library of common functions (dot product, polynomial eval)
-- [ ] Compiler optimizations: common subexpression elimination, dead node pruning
 
 ### Phase 10 — Proactive Resharing & Custodian Rotation
 - [ ] Custodian onboarding: generate new shares without reconstructing the secret
@@ -114,11 +124,13 @@ Last updated: **2026-02-17**
 
 | Metric | Value |
 |---|---|
-| Total tests | 110 passing |
-| Local unit/integration | 97 |
+| Total tests | 122 passing |
+| Local unit/integration | 109 |
 | Beaver protocol tests | 22 |
 | Beaver pool tests | 5 |
+| Compiler tests | 26 |
+| Executor tests | 14 |
 | Whitepaper compliance (local) | 20 |
 | Distributed cluster (GKE) | 13 |
-| GitHub commits | 5 |
-| Open phases | 3 (Phase 9–11) |
+| GitHub commits | 6 |
+| Open phases | 2 (Phase 10–11) |

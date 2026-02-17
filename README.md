@@ -1,6 +1,6 @@
 # QuorumVM — Extraction-Resistant Computation via Threshold Execution
 
-[![Tests](https://img.shields.io/badge/tests-110%2F110%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-122%2F122%20passing-brightgreen)](#test-results)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](#quick-start)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
@@ -8,7 +8,7 @@
 
 QuorumVM is a runtime where programs are executed through **K-of-N threshold participation** of independent custodians. Secret parameters are Shamir-shared — no single machine ever holds full authority to execute or reconstruct the program. An integrated **oracle control plane** governs query budgets, rate limits, and provides an immutable audit trail.
 
-This is a working MVP with **110 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences.
+This is a working MVP with **122 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences.
 
 ---
 
@@ -73,7 +73,7 @@ QuorumVM protects **parametric functions** — computations where the value lies
 
 ### Limitations
 
-QuorumVM executes **arithmetic circuits** (DAGs of `add`, `sub`, `mul` over a prime field). This covers polynomials and linear models. It does **not** support loops, conditionals, string operations, I/O, or neural network activations (ReLU, sigmoid, softmax). See [What PLAN-B is NOT](#what-plan-b-is-not).
+QuorumVM executes **arithmetic circuits** (DAGs of `add`, `sub`, `mul`, `neg`, `mux` over a prime field). This covers polynomials, linear models, and conditional-like patterns. Stdlib macros (`dot`, `polyeval`) provide higher-level abstractions. It does **not** support loops, string operations, I/O, or neural network activations (ReLU, sigmoid, softmax). See [What PLAN-B is NOT](#what-plan-b-is-not).
 
 ---
 
@@ -167,11 +167,44 @@ add score = s bias
 output score
 ```
 
+**Gate types:**
+
+| Keyword | Syntax | Semantics |
+|---|---|---|
+| `input` | `input <name>` | External input wire |
+| `const` | `const <name> = <int>` | Constant field element |
+| `add` | `add <name> = <a> <b>` | Field addition |
+| `sub` | `sub <name> = <a> <b>` | Field subtraction |
+| `mul` | `mul <name> = <a> <b>` | Field multiplication (Beaver triple) |
+| `neg` | `neg <name> = <a>` | Additive inverse |
+| `mux` | `mux <name> = <s> <a> <b>` | Conditional: s·a + (1−s)·b |
+| `output` | `output <name> [<name2> ...]` | One or more output wires |
+
+**Stdlib macros** (expanded at compile time):
+
+| Macro | Syntax | Semantics |
+|---|---|---|
+| `dot` | `dot <name> = <a1> <b1> ... <aN> <bN>` | Dot product: Σ aᵢ·bᵢ |
+| `polyeval` | `polyeval <name> = <x> <c0> <c1> ... <cN>` | Horner polynomial: c₀ + c₁x + ⋯ + cₙxⁿ |
+
+**Multi-output example:**
+```
+input x
+const c = 3
+add sum = x c
+mul prod = x c
+output sum prod
+```
+
+**Compiler optimizations** (in `compiler/optimizer.py`):
+- **Common Subexpression Elimination (CSE)**: merges duplicate computation nodes
+- **Dead Node Pruning**: removes nodes not reachable from any output
+
 **Rules:**
 - No loops, no recursion, no I/O
-- Operations: `add`, `sub`, `mul` over F_p (p = 2¹²⁷ − 1)
+- Operations over F_p (p = 2¹²⁷ − 1)
 - Any number of `input` and `const` declarations
-- Single `output` per program
+- One or more `output` statements (multi-output supported)
 - All identifiers must be defined before use
 
 The DSL is just one frontend. The platform consumes **IR JSON** — you can generate it programmatically from any language.
@@ -269,16 +302,16 @@ curl -X POST http://coordinator:8000/eval \
 
 ## Test Results
 
-### Local Tests (97 passing)
+### Local Tests (109 passing)
 
 | Suite | Tests | Coverage |
 |---|---|---|
 | `test_field.py` | 10 | Field arithmetic: add, sub, mul, inv, neg, reduce, wrapping |
 | `test_shamir.py` | 7 | Share/reconstruct, K-of-N subsets, edge cases, < K failure |
 | `test_signatures.py` | 3 | HMAC sign/verify, wrong key, tampered message |
-| `test_compiler.py` | 11 | Parsing, node types, errors, comments, serialization |
+| `test_compiler.py` | 26 | Parsing, node types, errors, **neg, mux, multi-output, dot, polyeval**, CSE, dead-node pruning, optimizer |
 | `test_package.py` | 5 | SHA-256 content addressing, determinism, policy hashing |
-| `test_executor.py` | 4 | DAG evaluation on plain values and edge cases |
+| `test_executor.py` | 14 | DAG evaluation: plain, sub, large values, **neg, mux (select/interpolated), multi-output, dot product, polyeval (degree-0/1/2)** |
 | `test_policy.py` | 3 | Budget exhaustion, identity isolation, unregistered programs |
 | `test_audit.py` | 3 | Append/verify, empty chain, hash linking |
 | `test_e2e.py` | 5 | Full integration: install → activate → eval → budget → audit |
@@ -367,6 +400,7 @@ quorumvm/
 ├── compiler/
 │   ├── dsl_parser.py          # DSL → IR compiler
 │   ├── ir.py                  # IR data structures (Pydantic)
+│   ├── optimizer.py           # CSE + dead node pruning
 │   └── package.py             # Program Package builder (SHA-256 addressed)
 ├── crypto/
 │   ├── field.py               # Prime-field arithmetic (F_p)

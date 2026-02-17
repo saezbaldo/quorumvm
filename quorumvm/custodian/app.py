@@ -180,7 +180,10 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
 
     @app.post("/eval_share")
     async def eval_share(req: CustodianEvalShareRequest):
-        """Legacy evaluation: plain values, no Beaver protocol."""
+        """Legacy evaluation: plain values, no Beaver protocol.
+
+        Supports multi-output: returns ``outputs`` dict alongside ``y``.
+        """
         pid = req.program_id
         if pid not in state.installed:
             raise HTTPException(404, "Program not installed on this custodian")
@@ -195,8 +198,19 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
 
         output_val = evaluate_ir(ir, input_share_vals, const_shares)
 
+        # Multi-output support
+        from quorumvm.custodian.executor import evaluate_ir_multi
+        output_ids = ir.get("output_node_ids", [])
+        outputs_dict: Dict[str, str] = {}
+        if output_ids and len(output_ids) > 1:
+            multi = evaluate_ir_multi(ir, input_share_vals, const_shares)
+            outputs_dict = {k: str(v) for k, v in multi.items()}
+
         x = state.index + 1  # shares use x = 1..N
-        return {"x": x, "y": str(output_val), "request_id": req.request_id}
+        resp: Dict[str, Any] = {"x": x, "y": str(output_val), "request_id": req.request_id}
+        if outputs_dict:
+            resp["outputs"] = outputs_dict
+        return resp
 
     @app.post("/eval_beaver")
     async def eval_beaver(req: BeaverEvalRequest):
@@ -264,12 +278,17 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
 
         # No muls or DAG completed
         x = state.index + 1
-        return {
+        resp: Dict[str, Any] = {
             "status": "done",
             "x": x,
             "y": str(executor.output()),
             "request_id": req.request_id,
         }
+        # Multi-output
+        multi = executor.outputs()
+        if len(multi) > 1:
+            resp["outputs"] = {k: str(v) for k, v in multi.items()}
+        return resp
 
     @app.post("/beaver_round2")
     async def beaver_round2(req: BeaverRound2Request):
@@ -314,12 +333,16 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
         output = executor.output()
         # Clean up
         del state._executors[req.request_id]
-        return {
+        resp_r2: Dict[str, Any] = {
             "status": "done",
             "x": x,
             "y": str(output),
             "request_id": req.request_id,
         }
+        multi_r2 = executor.outputs()
+        if len(multi_r2) > 1:
+            resp_r2["outputs"] = {k: str(v) for k, v in multi_r2.items()}
+        return resp_r2
 
     @app.post("/beaver_shares")
     async def receive_beaver_shares(req: BeaverP2PSharesRequest):
@@ -425,12 +448,16 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
         del state._executors[req.request_id]
         state._p2p_shares.pop(req.request_id, None)
         state._own_mul_shares.pop(req.request_id, None)
-        return {
+        resp_p2p: Dict[str, Any] = {
             "status": "done",
             "x": x,
             "y": str(output),
             "request_id": req.request_id,
         }
+        multi_p2p = executor.outputs()
+        if len(multi_p2p) > 1:
+            resp_p2p["outputs"] = {k: str(v) for k, v in multi_p2p.items()}
+        return resp_p2p
 
     @app.get("/health")
     async def health():

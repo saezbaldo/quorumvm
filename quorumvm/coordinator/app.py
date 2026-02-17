@@ -97,6 +97,16 @@ def _find_mul_nodes(ir: dict) -> List[str]:
     return [n["id"] for n in ir["nodes"] if n["type"] == "mul"]
 
 
+def _get_output_ids(ir: dict) -> List[str]:
+    """Return the list of output node IDs from the IR."""
+    ids = ir.get("output_node_ids", [])
+    if not ids:
+        oid = ir.get("output_node_id")
+        if oid:
+            ids = [oid]
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -273,8 +283,14 @@ async def _eval_legacy(
     n: int,
     k: int,
 ) -> dict:
-    """Legacy evaluation: send shared inputs, collect output shares, reconstruct."""
+    """Legacy evaluation: send shared inputs, collect output shares, reconstruct.
+
+    Supports multi-output: if custodians return ``outputs``, each output
+    is reconstructed independently.
+    """
     output_shares: List[Tuple[int, int]] = []
+    # Multi-output: output_name -> list of (x, y) shares
+    multi_output_shares: Dict[str, List[Tuple[int, int]]] = {}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         for idx in range(n):
@@ -288,7 +304,14 @@ async def _eval_legacy(
                 resp = await client.post(url, json=payload)
                 resp.raise_for_status()
                 body = resp.json()
-                output_shares.append((int(body["x"]), int(str(body["y"]))))
+                x_val = int(body["x"])
+                output_shares.append((x_val, int(str(body["y"]))))
+                # Collect multi-output shares if present
+                if "outputs" in body:
+                    for oname, oy in body["outputs"].items():
+                        if oname not in multi_output_shares:
+                            multi_output_shares[oname] = []
+                        multi_output_shares[oname].append((x_val, int(str(oy))))
             except Exception:
                 pass
 
@@ -297,6 +320,13 @@ async def _eval_legacy(
 
     # Reconstruct output via Lagrange interpolation
     result = shamir.reconstruct(output_shares[:k])
+
+    # Multi-output reconstruction
+    results_dict: Dict[str, int] = {}
+    if multi_output_shares:
+        for oname, shares in multi_output_shares.items():
+            if len(shares) >= k:
+                results_dict[oname] = shamir.reconstruct(shares[:k])
 
     _audit.append(
         "eval_ok",
@@ -308,7 +338,10 @@ async def _eval_legacy(
             "mode": "legacy",
         },
     )
-    return {"result": result, "request_id": request_id}
+    response: Dict[str, Any] = {"result": result, "request_id": request_id}
+    if results_dict:
+        response["results"] = results_dict
+    return response
 
 
 async def _eval_beaver(
@@ -418,9 +451,16 @@ async def _eval_beaver(
 
         # ---- Collect output shares and reconstruct ----
         output_shares: List[Tuple[int, int]] = []
+        multi_output_shares: Dict[str, List[Tuple[int, int]]] = {}
         for idx, r in responses.items():
             if r.get("status") == "done":
-                output_shares.append((int(r["x"]), int(str(r["y"]))))
+                x_val = int(r["x"])
+                output_shares.append((x_val, int(str(r["y"]))))
+                if "outputs" in r:
+                    for oname, oy in r["outputs"].items():
+                        if oname not in multi_output_shares:
+                            multi_output_shares[oname] = []
+                        multi_output_shares[oname].append((x_val, int(str(oy))))
 
         if len(output_shares) < k:
             raise HTTPException(
@@ -432,6 +472,13 @@ async def _eval_beaver(
         # Custodian 0 already folded ε*δ into its share.
         result = shamir.reconstruct(output_shares[:k])
 
+        # Multi-output reconstruction
+        results_dict: Dict[str, int] = {}
+        if multi_output_shares:
+            for oname, shares in multi_output_shares.items():
+                if len(shares) >= k:
+                    results_dict[oname] = shamir.reconstruct(shares[:k])
+
     _audit.append(
         "eval_ok",
         {
@@ -442,7 +489,10 @@ async def _eval_beaver(
             "mode": "beaver_p2p",
         },
     )
-    return {"result": result, "request_id": request_id}
+    response: Dict[str, Any] = {"result": result, "request_id": request_id}
+    if results_dict:
+        response["results"] = results_dict
+    return response
 
 
 class ReplenishRequest(BaseModel):

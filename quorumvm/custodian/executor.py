@@ -18,6 +18,11 @@ coordinator.  The executor supports two modes:
    Beaver protocol.  After the coordinator resolves the masked values
    and sends them back, the executor resumes.
 
+Supported node types: input, const, add, sub, mul, neg, mux.
+
+The ``mux`` node implements ``mux(s, a, b) = s*a + (1-s)*b`` and
+decomposes into two multiplications internally.
+
 The step-by-step mode is used by the Beaver-aware coordinator endpoint
 to achieve true secure multiplication on shares.
 """
@@ -147,6 +152,32 @@ class StepExecutor:
                     self.wires[nid] = field.sub(a_val, b_val)
                 self._cursor += 1
 
+            elif ntype == "neg":
+                a_id = node["inputs"][0]
+                self.wires[nid] = field.neg(self.wires[a_id])
+                self._cursor += 1
+
+            elif ntype == "mux":
+                # mux(s, a, b) = s*a + (1-s)*b
+                # Treated as two mul nodes for Beaver purposes.
+                # The compiler should have already expanded mux into
+                # mul + mul + add in the IR, but we also support
+                # native mux nodes that get decomposed at eval time.
+                # For the StepExecutor, mux with Beaver is handled
+                # by decomposing into two synthetic mul nodes at
+                # compile time.  If we hit a native mux here,
+                # we do a plain evaluation (legacy / non-Beaver mode).
+                s_id, a_id, b_id = node["inputs"]
+                s_val = self.wires[s_id]
+                a_val = self.wires[a_id]
+                b_val = self.wires[b_id]
+                # Plain evaluation: s*a + (1-s)*b
+                sa = field.mul(s_val, a_val)
+                one_minus_s = field.sub(1, s_val)
+                sb = field.mul(one_minus_s, b_val)
+                self.wires[nid] = field.add(sa, sb)
+                self._cursor += 1
+
             elif ntype == "mul":
                 a_id, b_id = node["inputs"]
                 x_share = self.wires[a_id]
@@ -215,11 +246,32 @@ class StepExecutor:
         self._pending_muls.clear()
 
     def output(self) -> int:
-        """Return the output wire value (call after ``done`` is True)."""
-        output_id = self.ir["output_node_id"]
-        if output_id not in self.wires:
+        """Return the output wire value (call after ``done`` is True).
+
+        Returns the first (or only) output.  For multi-output programs
+        use ``outputs()``.
+        """
+        output_id = self.ir.get("output_node_id") or self.ir.get("output_node_ids", [None])[0]
+        if output_id is None or output_id not in self.wires:
             raise RuntimeError("Output node not yet evaluated")
         return self.wires[output_id]
+
+    def outputs(self) -> Dict[str, int]:
+        """Return all output wire values as {name: value} dict.
+
+        Falls back to single-output if ``output_node_ids`` is absent.
+        """
+        ids = self.ir.get("output_node_ids", [])
+        if not ids:
+            oid = self.ir.get("output_node_id")
+            if oid:
+                ids = [oid]
+        result: Dict[str, int] = {}
+        for oid in ids:
+            if oid not in self.wires:
+                raise RuntimeError(f"Output node '{oid}' not yet evaluated")
+            result[oid] = self.wires[oid]
+        return result
 
 
 # --------------------------------------------------------------------------
@@ -275,10 +327,93 @@ def evaluate_ir(
                 wires[nid] = field.sub(a_val, b_val)
             elif ntype == "mul":
                 wires[nid] = field.mul(a_val, b_val)
+
+        elif ntype == "neg":
+            a_id = node["inputs"][0]
+            wires[nid] = field.neg(wires[a_id])
+
+        elif ntype == "mux":
+            s_id, a_id, b_id = node["inputs"]
+            s_val = wires[s_id]
+            a_val = wires[a_id]
+            b_val = wires[b_id]
+            sa = field.mul(s_val, a_val)
+            one_minus_s = field.sub(1, s_val)
+            sb = field.mul(one_minus_s, b_val)
+            wires[nid] = field.add(sa, sb)
+
         else:
             raise ValueError(f"Unknown node type '{ntype}'")
 
-    output_id = ir["output_node_id"]
-    if output_id not in wires:
+    output_id = ir.get("output_node_id") or ir.get("output_node_ids", [None])[0]
+    if output_id is None or output_id not in wires:
         raise ValueError(f"Output node '{output_id}' was not computed")
     return wires[output_id]
+
+
+def evaluate_ir_multi(
+    ir: Dict[str, Any],
+    input_shares: Dict[str, int],
+    const_shares: Dict[str, int],
+) -> Dict[str, int]:
+    """Evaluate the DAG and return all output shares as {name: value}.
+
+    This is the multi-output variant of ``evaluate_ir``.
+    """
+    wires: Dict[str, int] = {}
+
+    for node in ir["nodes"]:
+        nid = node["id"]
+        ntype = node["type"]
+
+        if ntype == "input":
+            if nid not in input_shares:
+                raise ValueError(f"Missing input share for '{nid}'")
+            wires[nid] = input_shares[nid]
+
+        elif ntype == "const":
+            if nid in const_shares:
+                wires[nid] = const_shares[nid]
+            else:
+                wires[nid] = field.reduce(node["value"])
+
+        elif ntype in ("add", "sub", "mul"):
+            a_id, b_id = node["inputs"]
+            a_val = wires[a_id]
+            b_val = wires[b_id]
+            if ntype == "add":
+                wires[nid] = field.add(a_val, b_val)
+            elif ntype == "sub":
+                wires[nid] = field.sub(a_val, b_val)
+            elif ntype == "mul":
+                wires[nid] = field.mul(a_val, b_val)
+
+        elif ntype == "neg":
+            a_id = node["inputs"][0]
+            wires[nid] = field.neg(wires[a_id])
+
+        elif ntype == "mux":
+            s_id, a_id, b_id = node["inputs"]
+            s_val = wires[s_id]
+            a_val = wires[a_id]
+            b_val = wires[b_id]
+            sa = field.mul(s_val, a_val)
+            one_minus_s = field.sub(1, s_val)
+            sb = field.mul(one_minus_s, b_val)
+            wires[nid] = field.add(sa, sb)
+
+        else:
+            raise ValueError(f"Unknown node type '{ntype}'")
+
+    output_ids = ir.get("output_node_ids", [])
+    if not output_ids:
+        oid = ir.get("output_node_id")
+        if oid:
+            output_ids = [oid]
+
+    results: Dict[str, int] = {}
+    for oid in output_ids:
+        if oid not in wires:
+            raise ValueError(f"Output node '{oid}' was not computed")
+        results[oid] = wires[oid]
+    return results
