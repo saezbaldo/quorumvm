@@ -1,6 +1,6 @@
 # QuorumVM — Extraction-Resistant Computation via Threshold Execution
 
-[![Tests](https://img.shields.io/badge/tests-166%2F166%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-191%2F191%20passing-brightgreen)](#test-results)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](#quick-start)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
@@ -8,7 +8,7 @@
 
 QuorumVM is a runtime where programs are executed through **K-of-N threshold participation** of independent custodians. Secret parameters are Shamir-shared — no single machine ever holds full authority to execute or reconstruct the program. An integrated **oracle control plane** governs query budgets, rate limits, and provides an immutable audit trail.
 
-This is a working MVP with **166 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences. **Proactive resharing** refreshes all shares periodically without reconstructing the secret, and **custodian rotation** enables onboarding and retiring custodians on the fly.
+This is a working MVP with **191 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences. **Proactive resharing** refreshes all shares periodically without reconstructing the secret, and **custodian rotation** enables onboarding and retiring custodians on the fly. A complete **formal security analysis** with 8 theorems (information-theoretic threshold security, Beaver correctness, ε/δ leakage, forward security, oracle extraction bounds) is computationally verified.
 
 ---
 
@@ -309,7 +309,7 @@ curl -X POST http://coordinator:8000/eval \
 
 ## Test Results
 
-### Local Tests (153 passing)
+### Local Tests (178 passing)
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -325,6 +325,7 @@ curl -X POST http://coordinator:8000/eval \
 | `test_beaver.py` | 26 | **Beaver triples**: generation, sharing, pool (pool_size param), protocol correctness (zero/one/large/commutative/associative), P2P round2 with ε*δ correction, StepExecutor pause/resume, E2E HTTP, **coordinator never sees ε,δ** (Phase 8 P2P) |
 | | 5 | **Beaver pool**: multiple evals, exhaustion (409), replenishment, pool status endpoint, distinct triples per eval |
 | `test_resharing.py` | 31 | **Proactive resharing & rotation**: zero-share poly, sub-share generation, reshare preserves secret, multi-round resharing, rotation (expand/shrink/replace), Lagrange interpolation, edge cases (k=n, zero/large secrets), HTTP endpoint integration (6 async tests) |
+| `test_security_analysis.py` | 25 | **Formal security verification**: Thm 1 (info-theoretic threshold), Thm 2 (Beaver algebraic correctness), Thm 3 (ε,δ uniform leakage), Thm 4 (coordinator zero-knowledge), Thm 5 (resharing 100-round), Thm 6 (forward security), Thm 7 (extraction bounds), Thm 8 (budget blocks extraction), SPDZ comparison |
 
 ### Whitepaper Compliance Tests (20 passing locally)
 
