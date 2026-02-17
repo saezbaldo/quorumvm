@@ -20,6 +20,7 @@ from quorumvm.crypto.beaver import (
     coordinator_finalize,
     custodian_mul_round1,
     custodian_mul_round2,
+    custodian_mul_round2_with_correction,
     generate_triple,
     generate_triple_shares,
     generate_triples_for_program,
@@ -190,6 +191,42 @@ class TestBeaverProtocol:
             result = self._run_beaver_mul(x, y)
             assert result == expected, f"Failed for {x} * {y}: got {result}, expected {expected}"
 
+    def test_p2p_round2_with_correction_no_finalize(self):
+        """Phase 8: custodian_mul_round2_with_correction folds ε*δ so that
+        plain Lagrange reconstruction yields x*y without coordinator_finalize."""
+        n, k = 3, 2
+        x_val, y_val = 6, 7
+
+        x_shares = shamir.share(x_val, n, k)
+        y_shares = shamir.share(y_val, n, k)
+        ts = generate_triple_shares(n, k)
+
+        # Round 1
+        eps_shares, delta_shares = [], []
+        for i in range(n):
+            eps_i, delta_i = custodian_mul_round1(
+                x_shares[i][1], y_shares[i][1],
+                ts.a_shares[i][1], ts.b_shares[i][1],
+            )
+            eps_shares.append((i + 1, eps_i))
+            delta_shares.append((i + 1, delta_i))
+
+        epsilon = shamir.reconstruct(eps_shares[:k])
+        delta = shamir.reconstruct(delta_shares[:k])
+
+        # Round 2 with correction (all custodians add ε*δ)
+        z_shares_corrected = []
+        for i in range(n):
+            z_i = custodian_mul_round2_with_correction(
+                epsilon, delta,
+                ts.a_shares[i][1], ts.b_shares[i][1], ts.c_shares[i][1],
+            )
+            z_shares_corrected.append((i + 1, z_i))
+
+        # Plain Lagrange reconstruction — NO coordinator_finalize needed
+        result = shamir.reconstruct(z_shares_corrected[:k])
+        assert result == 42, f"Expected 42, got {result}"
+
 
 # =========================================================================
 # 4. StepExecutor with Beaver triples
@@ -335,7 +372,6 @@ class TestBeaverE2E:
         coord_module._approvals.clear()
         coord_module._status.clear()
         coord_module._beaver_ready.clear()
-        coord_module._beaver_epsilons.clear()
         coord_module._beaver_pool_remaining.clear()
         coord_module._policy = coord_module.PolicyEngine()
         coord_module._audit = coord_module.AuditLog()
@@ -416,6 +452,100 @@ class TestBeaverE2E:
             await c.aclose()
 
     @pytest.mark.asyncio
+    async def test_coordinator_never_sees_epsilon_delta(self, setup_services):
+        """Phase 8: coordinator must not reconstruct or store ε, δ.
+
+        Verify that the coordinator module has no _beaver_epsilons attribute
+        and that the audit log records mode 'beaver_p2p' (not 'beaver').
+        """
+        from httpx import ASGITransport, AsyncClient
+        from unittest.mock import patch
+        import quorumvm.coordinator.app as coord_module
+
+        svc = setup_services
+        coordinator_app = svc["coordinator_app"]
+        custodian_apps = svc["custodian_apps"]
+        pkg = svc["pkg"]
+
+        # Verify _beaver_epsilons no longer exists
+        assert not hasattr(coord_module, "_beaver_epsilons"), \
+            "coordinator must not have _beaver_epsilons (Phase 8 P2P)"
+
+        # Reset state
+        coord_module._packages.clear()
+        coord_module._approvals.clear()
+        coord_module._status.clear()
+        coord_module._beaver_ready.clear()
+        coord_module._beaver_pool_remaining.clear()
+        coord_module._policy = coord_module.PolicyEngine()
+        coord_module._audit = coord_module.AuditLog()
+
+        pkg_dict = pkg.model_dump()
+
+        custodian_transports = [
+            ASGITransport(app=app) for app in custodian_apps
+        ]
+        custodian_clients = [
+            AsyncClient(transport=t, base_url=f"http://custodian-{i}")
+            for i, t in enumerate(custodian_transports)
+        ]
+
+        S_v = 42
+        shares = shamir.share(S_v, NUM_CUSTODIANS, THRESHOLD)
+        for i, client in enumerate(custodian_clients):
+            x, y = shares[i]
+            await client.post("/install", json={
+                "program_package": pkg_dict,
+                "share_x": str(x),
+                "share_y": str(y),
+            })
+
+        original_post = AsyncClient.post
+
+        async def mock_post(self_client, url: str, **kwargs):
+            for i in range(NUM_CUSTODIANS):
+                prefix = f"http://custodian-{i}:{9100 + i}"
+                if url.startswith(prefix):
+                    path = url[len(prefix):]
+                    return await custodian_clients[i].post(path, **kwargs)
+            return await original_post(self_client, url, **kwargs)
+
+        coord_transport = ASGITransport(app=coordinator_app)
+        async with AsyncClient(transport=coord_transport, base_url="http://coordinator") as coord_client:
+            with patch.object(AsyncClient, "post", mock_post):
+                await coord_client.post("/install", json={
+                    "program_package": pkg_dict,
+                    "generate_beaver": True,
+                })
+                from quorumvm.crypto import signatures
+                for i in range(THRESHOLD):
+                    sig = signatures.sign(i, pkg.program_id)
+                    await coord_client.post("/approve", json={
+                        "program_id": pkg.program_id,
+                        "custodian_index": i,
+                        "signature": sig,
+                    })
+                resp = await coord_client.post("/eval", json={
+                    "identity_id": "p2p-user",
+                    "program_id": pkg.program_id,
+                    "inputs": {"x": 3},
+                })
+                assert resp.status_code == 200
+                assert resp.json()["result"] == 100
+
+        # Check audit log records beaver_p2p mode
+        coord_transport2 = ASGITransport(app=coordinator_app)
+        async with AsyncClient(transport=coord_transport2, base_url="http://coordinator") as audit_client:
+            resp = await audit_client.get("/audit")
+            entries = resp.json()["entries"]
+            eval_entries = [e for e in entries if e["event"] == "eval_ok"]
+            assert len(eval_entries) == 1
+            assert eval_entries[0]["data"]["mode"] == "beaver_p2p"
+
+        for c in custodian_clients:
+            await c.aclose()
+
+    @pytest.mark.asyncio
     async def test_beaver_eval_pure_linear_no_beaver(self, setup_services):
         """A pure linear program should work without Beaver triples."""
         from httpx import ASGITransport, AsyncClient
@@ -429,7 +559,6 @@ class TestBeaverE2E:
         coord_module._approvals.clear()
         coord_module._status.clear()
         coord_module._beaver_ready.clear()
-        coord_module._beaver_epsilons.clear()
         coord_module._beaver_pool_remaining.clear()
         coord_module._policy = coord_module.PolicyEngine()
         coord_module._audit = coord_module.AuditLog()
@@ -552,7 +681,6 @@ class TestBeaverPool:
         coord_module._approvals.clear()
         coord_module._status.clear()
         coord_module._beaver_ready.clear()
-        coord_module._beaver_epsilons.clear()
         coord_module._beaver_pool_remaining.clear()
         coord_module._policy = coord_module.PolicyEngine()
         coord_module._audit = coord_module.AuditLog()

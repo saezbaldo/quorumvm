@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from quorumvm.config import NUM_CUSTODIANS, THRESHOLD
+from quorumvm.config import CUSTODIAN_URLS, NUM_CUSTODIANS, PRIME, THRESHOLD
 from quorumvm.crypto import shamir, signatures
 from quorumvm.custodian.executor import (
     MulRequest,
@@ -83,6 +83,22 @@ class BeaverRound2Request(BaseModel):
     resolutions: List[Dict[str, Any]]  # [{node_id, epsilon, delta}, ...]
 
 
+class BeaverP2PSharesRequest(BaseModel):
+    """Receive ε,δ shares from another custodian for P2P reconstruction."""
+
+    request_id: str
+    from_custodian: int  # sender’s Shamir x-coordinate (1-based)
+    shares: List[Dict[str, Any]]  # [{node_id, epsilon_share, delta_share}]
+
+
+class BeaverResolveP2PRequest(BaseModel):
+    """Coordinator tells custodian to reconstruct ε,δ locally and finish Round 2."""
+
+    program_id: str
+    request_id: str
+    mul_node_ids: List[str]  # which mul nodes to resolve
+
+
 class CustodianState:
     """Per-custodian mutable state."""
 
@@ -95,6 +111,10 @@ class CustodianState:
         self.beaver_pools: Dict[str, Dict[str, List[Dict[str, Tuple[int, int]]]]] = {}
         # request_id -> StepExecutor (for multi-round eval)
         self._executors: Dict[str, StepExecutor] = {}
+        # P2P: request_id -> {node_id -> [(x_coord, eps_share, delta_share)]}
+        self._p2p_shares: Dict[str, Dict[str, List[Tuple[int, int, int]]]] = {}
+        # P2P: request_id -> {node_id -> (own_eps_share, own_delta_share)}
+        self._own_mul_shares: Dict[str, Dict[str, Tuple[int, int]]] = {}
 
 
 def create_app(state: CustodianState | None = None) -> FastAPI:
@@ -217,6 +237,18 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
         mul_reqs = executor.step()
 
         if mul_reqs:
+            # Store own shares for P2P exchange
+            own_shares: Dict[str, Tuple[int, int]] = {}
+            for mr in mul_reqs:
+                own_shares[mr.node_id] = (mr.epsilon_share, mr.delta_share)
+            state._own_mul_shares[req.request_id] = own_shares
+            # Initialize P2P collection with own shares
+            p2p: Dict[str, List[Tuple[int, int, int]]] = {}
+            x_coord = state.index + 1
+            for mr in mul_reqs:
+                p2p[mr.node_id] = [(x_coord, mr.epsilon_share, mr.delta_share)]
+            state._p2p_shares[req.request_id] = p2p
+
             return {
                 "status": "mul_pending",
                 "mul_requests": [
@@ -282,6 +314,117 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
         output = executor.output()
         # Clean up
         del state._executors[req.request_id]
+        return {
+            "status": "done",
+            "x": x,
+            "y": str(output),
+            "request_id": req.request_id,
+        }
+
+    @app.post("/beaver_shares")
+    async def receive_beaver_shares(req: BeaverP2PSharesRequest):
+        """Receive \u03b5,\u03b4 shares from another custodian (P2P exchange).
+
+        Each custodian broadcasts its shares to all peers.  This endpoint
+        collects them so the custodian can later reconstruct \u03b5,\u03b4 locally.
+        """
+        rid = req.request_id
+        if rid not in state._p2p_shares:
+            state._p2p_shares[rid] = {}
+
+        for s in req.shares:
+            nid = s["node_id"]
+            if nid not in state._p2p_shares[rid]:
+                state._p2p_shares[rid][nid] = []
+            state._p2p_shares[rid][nid].append((
+                req.from_custodian,
+                int(str(s["epsilon_share"])),
+                int(str(s["delta_share"])),
+            ))
+
+        return {"status": "received", "custodian": state.index}
+
+    @app.post("/beaver_resolve_p2p")
+    async def beaver_resolve_p2p(req: BeaverResolveP2PRequest):
+        """Reconstruct \u03b5,\u03b4 locally from collected P2P shares and finish Round 2.
+
+        The coordinator never sees the reconstructed \u03b5 or \u03b4.  One designated
+        custodian (index 0) folds in the \u03b5*\u03b4 correction so that plain Lagrange
+        reconstruction of the output shares yields x*y directly.
+        """
+        from quorumvm.crypto.beaver import custodian_mul_round2_with_correction
+
+        executor = state._executors.get(req.request_id)
+        if executor is None:
+            raise HTTPException(404, "No active executor for this request_id")
+
+        p2p = state._p2p_shares.get(req.request_id, {})
+        k = THRESHOLD
+
+        # Reconstruct ε,δ locally and build resolutions
+        resolutions: List[MulResolution] = []
+        for nid in req.mul_node_ids:
+            shares_list = p2p.get(nid, [])
+            if len(shares_list) < k:
+                raise HTTPException(
+                    503,
+                    f"Not enough P2P shares for node {nid}: {len(shares_list)} < {k}",
+                )
+            eps_points = [(x, eps) for x, eps, _ in shares_list[:k]]
+            delta_points = [(x, delta) for x, _, delta in shares_list[:k]]
+            epsilon = shamir.reconstruct(eps_points)
+            delta = shamir.reconstruct(delta_points)
+            resolutions.append(MulResolution(nid, epsilon, delta))
+
+        # Apply resolutions: each custodian locally computes z_i with ε*δ correction
+        for res in resolutions:
+            nid = res.node_id
+            if nid not in executor.beaver_shares:
+                raise ValueError(f"No Beaver shares for node '{nid}'")
+            bshares = executor.beaver_shares[nid]
+            z_share = custodian_mul_round2_with_correction(
+                epsilon=res.epsilon,
+                delta=res.delta,
+                a_share_y=bshares["a"][1],
+                b_share_y=bshares["b"][1],
+                c_share_y=bshares["c"][1],
+            )
+            executor.wires[nid] = z_share
+        executor._pending_muls.clear()
+
+        # Continue stepping
+        mul_reqs = executor.step()
+
+        if mul_reqs:
+            # More muls encountered — store own shares for next P2P round
+            own_shares: Dict[str, Tuple[int, int]] = {}
+            x_coord = state.index + 1
+            new_p2p: Dict[str, List[Tuple[int, int, int]]] = {}
+            for mr in mul_reqs:
+                own_shares[mr.node_id] = (mr.epsilon_share, mr.delta_share)
+                new_p2p[mr.node_id] = [(x_coord, mr.epsilon_share, mr.delta_share)]
+            state._own_mul_shares[req.request_id] = own_shares
+            state._p2p_shares[req.request_id] = new_p2p
+
+            return {
+                "status": "mul_pending",
+                "mul_requests": [
+                    {
+                        "node_id": mr.node_id,
+                        "epsilon_share": str(mr.epsilon_share),
+                        "delta_share": str(mr.delta_share),
+                    }
+                    for mr in mul_reqs
+                ],
+                "request_id": req.request_id,
+            }
+
+        # DAG completed — clean up
+        x = state.index + 1
+        output = executor.output()
+        del state._executors[req.request_id]
+        state._p2p_shares.pop(req.request_id, None)
+        state._own_mul_shares.pop(req.request_id, None)
         return {
             "status": "done",
             "x": x,

@@ -1,6 +1,6 @@
 # QuorumVM — Roadmap
 
-Last updated: **2025-07-16**
+Last updated: **2026-02-17**
 
 ---
 
@@ -62,14 +62,23 @@ Last updated: **2025-07-16**
 
 ##  Planned
 
-### Phase 8 — Coordinator Visibility Reduction
-**Problem**: Coordinator currently sees reconstructed (ε, δ) during Beaver rounds. While these are masked and reveal nothing about raw inputs, a malicious coordinator could attempt offline attacks.
+### Phase 8 — Coordinator Visibility Reduction (P2P Beaver)
+- [x] Peer-to-peer ε,δ share exchange between custodians (`POST /beaver_shares`)
+- [x] Local reconstruction: each custodian reconstructs ε,δ via Lagrange (`POST /beaver_resolve_p2p`)
+- [x] ε*δ correction folded into all custodian shares (Σ L_i(0)=1 property)
+- [x] Coordinator no longer reconstructs ε or δ — zero visibility
+- [x] `coordinator_finalize()` no longer called in production flow (kept for backward compat)
+- [x] `_beaver_epsilons` state dict removed from coordinator
+- [x] `custodian_mul_round2_with_correction()` added to `crypto/beaver.py`
+- [x] Audit log records `mode: "beaver_p2p"` for P2P evaluations
+- [x] 2 new Phase 8 tests: `test_coordinator_never_sees_epsilon_delta`, `test_p2p_round2_with_correction_no_finalize`
+- [x] Graceful degradation works with P2P (K=2 of N=3 custodians)
+- [x] All 110 tests passing (97 local + 13 cluster)
+- [x] Docker image `v4-p2p-beaver` deployed, 13/13 distributed tests pass
 
-- [ ] Research: peer-to-peer custodian communication for masked-diff exchange
-- [ ] Research: threshold reconstruction without coordinator (custodian-to-custodian shares)
-- [ ] Evaluate trade-offs: latency, complexity, trust model
+---
 
-### Phase 9 — DSL Expansion
+## 📋 Planned
 - [ ] Constants in DSL (`const seven = 7`)
 - [ ] Multi-output programs (return multiple values)
 - [ ] Conditional-like patterns via MUX gates: `mux(selector, a, b)`
@@ -105,11 +114,11 @@ Last updated: **2025-07-16**
 
 | Metric | Value |
 |---|---|
-| Total tests | 108 passing |
-| Local unit/integration | 95 |
-| Beaver protocol tests | 20 |
+| Total tests | 110 passing |
+| Local unit/integration | 97 |
+| Beaver protocol tests | 22 |
 | Beaver pool tests | 5 |
 | Whitepaper compliance (local) | 20 |
 | Distributed cluster (GKE) | 13 |
-| GitHub commits | 4 |
-| Open phases | 4 (Phase 8–11) |
+| GitHub commits | 5 |
+| Open phases | 3 (Phase 9–11) |

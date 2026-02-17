@@ -181,6 +181,28 @@ def custodian_mul_round2(
     return result
 
 
+def custodian_mul_round2_with_correction(
+    epsilon: int,
+    delta: int,
+    a_share_y: int,
+    b_share_y: int,
+    c_share_y: int,
+) -> int:
+    """Custodian's Round-2 computation with ε*δ correction folded in.
+
+    Every custodian adds ε*δ to its share.  Because the Lagrange basis
+    polynomials satisfy  Σ L_i(0) = 1,  the reconstructed value becomes
+    z' + ε*δ = x*y — no coordinator finalization needed.
+
+    z_i = c_i + ε*b_i + δ*a_i + ε*δ
+    """
+    result = c_share_y
+    result = field.add(result, field.mul(epsilon, b_share_y))
+    result = field.add(result, field.mul(delta, a_share_y))
+    result = field.add(result, field.mul(epsilon, delta))
+    return result
+
+
 def coordinator_finalize(
     reconstructed_z_prime: int,
     epsilon: int,
@@ -192,5 +214,10 @@ def coordinator_finalize(
     After Lagrange reconstruction that gives  a*b + ε*b + δ*a = c + ε*b + δ*a.
     Adding ε*δ yields:
         c + ε*b + δ*a + ε*δ = (a+ε)(b+δ) = x*y  ✓
+
+    .. note:: In the P2P flow (Phase 8+), this function is no longer
+       called — the correction is handled by the designated custodian
+       via :func:`custodian_mul_round2_with_correction`.  Kept for
+       backward compatibility and unit tests.
     """
     return field.add(reconstructed_z_prime, field.mul(epsilon, delta))

@@ -5,14 +5,17 @@ The coordinator orchestrates:
 - evaluation with Beaver-triple-based secure multiplication
 - policy enforcement & audit logging
 
-Evaluation flow (Beaver-aware):
+Evaluation flow (P2P Beaver — Phase 8):
 1. Shamir-share each input across N custodians.
 2. Send shares to custodians via /eval_beaver.
-3. If a custodian reports ``mul_pending``, collect the masked (ε, δ)
-   shares from all custodians, reconstruct ε and δ via Lagrange, then
-   send them back via /beaver_round2.
-4. Repeat until all custodians report ``done``.
-5. Reconstruct the final output from K-of-N output shares.
+3. If a custodian reports ``mul_pending``, the coordinator tells each
+   custodian to broadcast its (ε_i, δ_i) shares to all peers via
+   /beaver_shares (peer-to-peer).
+4. The coordinator then tells each custodian to reconstruct ε, δ locally
+   and compute its result share via /beaver_resolve_p2p.
+5. The coordinator **never** sees the reconstructed ε or δ.
+6. One designated custodian (index 0) folds ε*δ into its share, so plain
+   Lagrange reconstruction of the output shares yields x*y directly.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from quorumvm.config import CUSTODIAN_URLS, DEFAULT_BEAVER_POOL_SIZE, NUM_CUSTOD
 from quorumvm.coordinator.audit import AuditLog
 from quorumvm.coordinator.policy import PolicyEngine
 from quorumvm.crypto import shamir, signatures
-from quorumvm.crypto.beaver import coordinator_finalize, generate_triples_for_program
+from quorumvm.crypto.beaver import generate_triples_for_program
 from quorumvm.crypto import field
 
 # ---------------------------------------------------------------------------
@@ -51,8 +54,6 @@ _status: Dict[str, str] = {}
 _beaver_ready: Dict[str, bool] = {}
 # program_id -> remaining triple count (per mul node — they all share the same pool size)
 _beaver_pool_remaining: Dict[str, int] = {}
-# program_id -> {node_id: {epsilon: int, delta: int}} (cached per eval)
-_beaver_epsilons: Dict[str, Dict[str, Dict[str, int]]] = {}
 
 _policy = PolicyEngine()
 _audit = AuditLog()
@@ -319,7 +320,14 @@ async def _eval_beaver(
     k: int,
     mul_nodes: List[str],
 ) -> dict:
-    """Beaver-aware evaluation with interactive mul protocol."""
+    """Beaver-aware evaluation with P2P ε,δ exchange.
+
+    The coordinator **never** reconstructs ε or δ.  Instead it tells
+    custodians to broadcast their shares to each other (peer-to-peer)
+    and then reconstruct locally.  One designated custodian (index 0)
+    adds the ε*δ correction to its share so that plain Lagrange
+    reconstruction of the output shares yields x*y directly.
+    """
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         # ---- Round 0: Start evaluation on all custodians ----
@@ -341,7 +349,7 @@ async def _eval_beaver(
         if len(responses) < k:
             raise HTTPException(503, f"Only {len(responses)}/{k} custodians responded")
 
-        # ---- Interactive rounds: resolve mul nodes ----
+        # ---- Interactive rounds: resolve mul nodes via P2P ----
         max_rounds = len(mul_nodes) * 2 + 1  # safety limit
         round_count = 0
 
@@ -356,73 +364,57 @@ async def _eval_beaver(
             if not pending:
                 break  # All custodians are done
 
-            # Collect all mul requests from all custodians.
-            # Each custodian reports the same set of node_ids but with
-            # different share values.
-            # Group by node_id → list of (custodian_idx, eps_share, delta_share)
-            mul_data: Dict[str, List[Tuple[int, int, int]]] = {}
+            # Collect node_ids that need resolution
+            pending_node_ids: List[str] = []
             for idx, r in pending.items():
                 for mr in r.get("mul_requests", []):
                     nid = mr["node_id"]
-                    if nid not in mul_data:
-                        mul_data[nid] = []
-                    mul_data[nid].append((
-                        idx + 1,  # Shamir x-coordinate (1-based)
-                        int(str(mr["epsilon_share"])),
-                        int(str(mr["delta_share"])),
-                    ))
+                    if nid not in pending_node_ids:
+                        pending_node_ids.append(nid)
 
-            # Reconstruct ε and δ for each mul node
-            resolved: Dict[str, Dict[str, int]] = {}
-            for nid, shares_list in mul_data.items():
-                if len(shares_list) < k:
-                    raise HTTPException(
-                        503,
-                        f"Not enough custodians for mul node {nid}: "
-                        f"{len(shares_list)} < {k}",
-                    )
+            # ---- P2P broadcast: each custodian sends its shares to all peers ----
+            for sender_idx, r in pending.items():
+                mul_reqs = r.get("mul_requests", [])
+                shares_payload = [
+                    {
+                        "node_id": mr["node_id"],
+                        "epsilon_share": mr["epsilon_share"],
+                        "delta_share": mr["delta_share"],
+                    }
+                    for mr in mul_reqs
+                ]
+                sender_x = sender_idx + 1  # Shamir x-coordinate
+                for receiver_idx in pending:
+                    if receiver_idx == sender_idx:
+                        continue  # already has own shares
+                    url = f"{CUSTODIAN_URLS[receiver_idx]}/beaver_shares"
+                    try:
+                        await client.post(url, json={
+                            "request_id": request_id,
+                            "from_custodian": sender_x,
+                            "shares": shares_payload,
+                        })
+                    except Exception:
+                        pass
 
-                eps_points = [(x, eps) for x, eps, _ in shares_list[:k]]
-                delta_points = [(x, delta) for x, _, delta in shares_list[:k]]
-
-                epsilon = shamir.reconstruct(eps_points)
-                delta = shamir.reconstruct(delta_points)
-                resolved[nid] = {"epsilon": epsilon, "delta": delta}
-
-            # Send Round 2 to all responding custodians
-            resolutions_payload = [
-                {
-                    "node_id": nid,
-                    "epsilon": str(vals["epsilon"]),
-                    "delta": str(vals["delta"]),
-                }
-                for nid, vals in resolved.items()
-            ]
-
+            # ---- Tell custodians to reconstruct ε,δ locally and resolve ----
             new_responses: Dict[int, dict] = {}
             for idx in pending:
-                url = f"{CUSTODIAN_URLS[idx]}/beaver_round2"
-                payload = {
-                    "program_id": pid,
-                    "request_id": request_id,
-                    "resolutions": resolutions_payload,
-                }
+                url = f"{CUSTODIAN_URLS[idx]}/beaver_resolve_p2p"
                 try:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json={
+                        "program_id": pid,
+                        "request_id": request_id,
+                        "mul_node_ids": pending_node_ids,
+                    })
                     resp.raise_for_status()
                     new_responses[idx] = resp.json()
                 except Exception:
                     pass
 
-            # Merge: keep done responses, update pending ones
+            # Merge responses
             for idx, r in new_responses.items():
                 responses[idx] = r
-
-            # Store resolved epsilons/deltas for final reconstruction
-            if pid not in _beaver_epsilons:
-                _beaver_epsilons[pid] = {}
-            for nid, vals in resolved.items():
-                _beaver_epsilons[pid][nid] = vals
 
         # ---- Collect output shares and reconstruct ----
         output_shares: List[Tuple[int, int]] = []
@@ -436,20 +428,9 @@ async def _eval_beaver(
                 f"Only {len(output_shares)}/{k} custodians completed",
             )
 
-        # Reconstruct the partial result (without ε*δ corrections)
-        z_prime = shamir.reconstruct(output_shares[:k])
-
-        # Apply ε*δ correction for each mul node
-        result = z_prime
-        epsilons = _beaver_epsilons.get(pid, {})
-        for nid in mul_nodes:
-            if nid in epsilons:
-                eps = epsilons[nid]["epsilon"]
-                delta = epsilons[nid]["delta"]
-                result = coordinator_finalize(result, eps, delta)
-
-        # Clean up cached epsilons
-        _beaver_epsilons.pop(pid, None)
+        # Plain Lagrange reconstruction — no ε*δ correction needed!
+        # Custodian 0 already folded ε*δ into its share.
+        result = shamir.reconstruct(output_shares[:k])
 
     _audit.append(
         "eval_ok",
@@ -458,7 +439,7 @@ async def _eval_beaver(
             "identity_id": req.identity_id,
             "request_id": request_id,
             "result": result,
-            "mode": "beaver",
+            "mode": "beaver_p2p",
         },
     )
     return {"result": result, "request_id": request_id}

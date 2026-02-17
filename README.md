@@ -1,6 +1,6 @@
 # QuorumVM — Extraction-Resistant Computation via Threshold Execution
 
-[![Tests](https://img.shields.io/badge/tests-108%2F108%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-110%2F110%20passing-brightgreen)](#test-results)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](#quick-start)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
@@ -8,7 +8,7 @@
 
 QuorumVM is a runtime where programs are executed through **K-of-N threshold participation** of independent custodians. Secret parameters are Shamir-shared — no single machine ever holds full authority to execute or reconstruct the program. An integrated **oracle control plane** governs query budgets, rate limits, and provides an immutable audit trail.
 
-This is a working MVP with **108 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** — no custodian ever sees plain input values or intermediate products.
+This is a working MVP with **110 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences.
 
 ---
 
@@ -99,7 +99,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements.txt
-pytest tests/ -v          # 108 tests, no Docker needed
+pytest tests/ -v          # 110 tests, no Docker needed
 ```
 
 ### Run the Demo
@@ -190,17 +190,17 @@ The DSL is just one frontend. The platform consumes **IR JSON** — you can gene
 | 4.4 | **Version activation is governed** | New versions require ≥ K custodian HMAC approval signatures |
 | 4.5 | **Graceful degradation** | Compromise impact scales with number of custodians compromised |
 
-### Beaver Triple Protocol (Secure Multiplication)
+### Beaver Triple Protocol (Secure Multiplication — P2P)
 
-Multiplying Shamir shares naively produces degree-2K polynomials that break the threshold scheme. QuorumVM solves this with the Beaver triple protocol:
+Multiplying Shamir shares naively produces degree-2K polynomials that break the threshold scheme. QuorumVM solves this with the Beaver triple protocol enhanced with **peer-to-peer (P2P)** share exchange:
 
 1. **Install phase**: Coordinator generates random triples (a, b, c) where c = a·b mod p, Shamir-shares them, and distributes shares to custodians alongside the program IR.
-2. **Eval Round 1**: Each custodian evaluates the DAG until hitting a `mul` node. It masks its input shares using its Beaver shares: εᵢ = x_share − aᵢ, δᵢ = y_share − bᵢ, and sends these to the coordinator. Execution pauses.
-3. **Coordinator reconstructs**: Collects ≥ K masked-diff shares, Lagrange-reconstructs ε = x − a and δ = y − b. These reveal nothing about x or y (masked by random a, b).
-4. **Eval Round 2**: Coordinator sends (ε, δ) back. Each custodian computes its output share: zᵢ = cᵢ + ε·bᵢ + δ·aᵢ.
-5. **Finalize**: Coordinator Lagrange-reconstructs z from ≥ K shares and adds ε·δ to get the final product x·y.
+2. **Eval Round 1**: Each custodian evaluates the DAG until hitting a `mul` node. It masks its input shares using its Beaver shares: εᵢ = x_share − aᵢ, δᵢ = y_share − bᵢ. Execution pauses.
+3. **P2P broadcast**: The coordinator orchestrates each custodian to send its (εᵢ, δᵢ) shares directly to all other custodians via `POST /beaver_shares`. **The coordinator never sees these values.**
+4. **Local reconstruction**: Each custodian collects ≥ K shares and locally Lagrange-reconstructs ε = x − a and δ = y − b. Then it computes its output share: zᵢ = cᵢ + ε·bᵢ + δ·aᵢ + ε·δ.
+5. **Reconstruct**: Coordinator Lagrange-reconstructs z from ≥ K output shares. Because every custodian folded ε·δ into its share (using the Σ Lᵢ(0) = 1 property), the result is x·y directly.
 
-**Key invariant**: No single party ever sees the raw inputs x or y. The coordinator sees only the masked differences ε, δ.
+**Key invariant**: No single party ever sees the raw inputs x or y. **The coordinator never sees ε or δ** — they are exchanged exclusively between custodians and reconstructed locally.
 
 ### Threat Model
 
@@ -248,7 +248,9 @@ Multiplying Shamir shares naively produces degree-2K polynomials that break the 
 | `POST` | `/eval_share` | Evaluate IR on input shares, return output (legacy) |
 | `POST` | `/install_beaver` | Install Beaver triple shares for mul nodes |
 | `POST` | `/eval_beaver` | Beaver-aware step-by-step evaluation |
-| `POST` | `/beaver_round2` | Receive reconstructed (ε, δ) and continue eval |
+| `POST` | `/beaver_round2` | Receive reconstructed (ε, δ) and continue eval (legacy) |
+| `POST` | `/beaver_shares` | Receive P2P ε,δ shares from another custodian |
+| `POST` | `/beaver_resolve_p2p` | Reconstruct ε,δ locally, compute Round 2, continue |
 | `GET` | `/health` | Health check |
 
 ### Example: Calling from Any Language
@@ -267,7 +269,7 @@ curl -X POST http://coordinator:8000/eval \
 
 ## Test Results
 
-### Local Tests (95 passing)
+### Local Tests (97 passing)
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -280,7 +282,7 @@ curl -X POST http://coordinator:8000/eval \
 | `test_policy.py` | 3 | Budget exhaustion, identity isolation, unregistered programs |
 | `test_audit.py` | 3 | Append/verify, empty chain, hash linking |
 | `test_e2e.py` | 5 | Full integration: install → activate → eval → budget → audit |
-| `test_beaver.py` | 25 | **Beaver triples**: generation, sharing, pool (pool_size param), protocol correctness (zero/one/large/commutative/associative), StepExecutor pause/resume, full E2E HTTP |
+| `test_beaver.py` | 26 | **Beaver triples**: generation, sharing, pool (pool_size param), protocol correctness (zero/one/large/commutative/associative), P2P round2 with ε*δ correction, StepExecutor pause/resume, E2E HTTP, **coordinator never sees ε,δ** (Phase 8 P2P) |
 | | 5 | **Beaver pool**: multiple evals, exhaustion (409), replenishment, pool status endpoint, distinct triples per eval |
 
 ### Whitepaper Compliance Tests (20 passing locally)

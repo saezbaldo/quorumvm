@@ -47,7 +47,6 @@ def _fresh_env():
     coord_module._approvals.clear()
     coord_module._status.clear()
     coord_module._beaver_ready.clear()
-    coord_module._beaver_epsilons.clear()
     coord_module._beaver_pool_remaining.clear()
     coord_module._policy = PolicyEngine()
     coord_module._audit = coord_module.AuditLog()
@@ -141,7 +140,9 @@ def _mock_custodian_eval(custodian_clients, pkg):
             if f"custodian-{i}" not in url:
                 continue
             # Determine which endpoint is being called
-            for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver", "/replenish_beaver"):
+            for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2",
+                            "/install_beaver", "/replenish_beaver",
+                            "/beaver_shares", "/beaver_resolve_p2p"):
                 if endpoint in url:
                     resp = cc.post(endpoint, json=json)
 
@@ -607,7 +608,8 @@ class TestGracefulDegradation:
                 if f"custodian-{i}" not in url:
                     continue
                 # Determine endpoint
-                for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver"):
+                for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2",
+                                "/install_beaver", "/beaver_shares", "/beaver_resolve_p2p"):
                     if endpoint in url:
                         if i == NUM_CUSTODIANS - 1:
                             raise ConnectionError("custodian unreachable")
@@ -661,7 +663,8 @@ class TestGracefulDegradation:
             for i, cc in enumerate(custodian_clients):
                 if f"custodian-{i}" not in url:
                     continue
-                for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2", "/install_beaver"):
+                for endpoint in ("/eval_beaver", "/eval_share", "/beaver_round2",
+                                "/install_beaver", "/beaver_shares", "/beaver_resolve_p2p"):
                     if endpoint in url:
                         if i >= alive:
                             raise ConnectionError("custodian unreachable")
