@@ -573,3 +573,263 @@ async def beaver_pool_status(program_id: str):
 async def audit():
     """Return the full audit log."""
     return AuditResponse(entries=_audit.entries(), chain_valid=_audit.verify_chain())
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Proactive Resharing & Custodian Rotation
+# ---------------------------------------------------------------------------
+
+
+class ReshareRequest(BaseModel):
+    """Request to perform proactive resharing of all secrets for a program."""
+
+    program_id: str
+
+
+class RotateRequest(BaseModel):
+    """Request to rotate custodians for a program.
+
+    ``retire_indices`` — 0-based indices of custodians to remove.
+    ``onboard_urls`` — URLs of new custodians to add.
+    ``onboard_x_coords`` — Shamir x-coordinates for new custodians (optional,
+                           defaults to N+1, N+2, ...).
+    """
+
+    program_id: str
+    retire_indices: List[int] = []
+    onboard_urls: List[str] = []
+    onboard_x_coords: List[int] = []
+
+
+@app.post("/reshare")
+async def reshare(req: ReshareRequest):
+    """Orchestrate a proactive resharing round for a program.
+
+    All current custodians generate zero-share polynomials and exchange
+    sub-shares.  At the end, every custodian holds a fresh share of the
+    same secret with a different underlying polynomial.
+
+    The coordinator **never** sees any share values — it only routes
+    the sub-shares between custodians.
+    """
+    pid = req.program_id
+    if pid not in _packages:
+        raise HTTPException(404, "Program not installed")
+    if _status.get(pid) != "ACTIVE":
+        raise HTTPException(400, "Program not active — resharing requires active status")
+
+    n = NUM_CUSTODIANS
+    k = THRESHOLD
+    target_x_coords = list(range(1, n + 1))
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Step 1: Ask each custodian to generate sub-shares
+        all_sub_shares: Dict[int, Dict[int, int]] = {}  # custodian_idx -> {x_j: δ}
+        for idx in range(n):
+            url = f"{CUSTODIAN_URLS[idx]}/reshare_generate"
+            try:
+                resp = await client.post(url, json={
+                    "program_id": pid,
+                    "target_x_coords": target_x_coords,
+                    "k": k,
+                })
+                resp.raise_for_status()
+                body = resp.json()
+                sub_map = {int(x): int(str(v)) for x, v in body["sub_shares"].items()}
+                all_sub_shares[idx] = sub_map
+            except Exception:
+                pass  # Custodian down — resharing is best-effort
+
+        if len(all_sub_shares) < k:
+            raise HTTPException(
+                503,
+                f"Only {len(all_sub_shares)}/{k} custodians participated in resharing",
+            )
+
+        # Step 2: Aggregate sub-shares per target and send to each custodian
+        for target_idx in range(n):
+            target_x = target_idx + 1
+            deltas = []
+            for sender_idx, sub_map in all_sub_shares.items():
+                if target_x in sub_map:
+                    deltas.append(sub_map[target_x])
+
+            url = f"{CUSTODIAN_URLS[target_idx]}/reshare_apply"
+            try:
+                resp = await client.post(url, json={
+                    "program_id": pid,
+                    "sub_shares": [str(d) for d in deltas],
+                })
+                resp.raise_for_status()
+            except Exception:
+                pass
+
+    _audit.append("reshare", {
+        "program_id": pid,
+        "participants": len(all_sub_shares),
+    })
+
+    return {
+        "status": "reshared",
+        "program_id": pid,
+        "participants": len(all_sub_shares),
+    }
+
+
+@app.post("/rotate")
+async def rotate(req: RotateRequest):
+    """Rotate custodians: onboard new ones and/or retire existing ones.
+
+    Protocol:
+    1. Current custodians generate sub-shares targeting the new set.
+    2. New custodians receive interpolated + sub-shared values.
+    3. Retired custodians delete their shares.
+    4. Beaver triples are regenerated for the new custodian set.
+
+    The coordinator **never** reconstructs the secret.
+    """
+    pid = req.program_id
+    if pid not in _packages:
+        raise HTTPException(404, "Program not installed")
+    if _status.get(pid) != "ACTIVE":
+        raise HTTPException(400, "Program not active")
+
+    n = NUM_CUSTODIANS
+    k = THRESHOLD
+
+    # Determine the surviving + new set
+    surviving_indices = [i for i in range(n) if i not in req.retire_indices]
+    if len(surviving_indices) < k:
+        raise HTTPException(
+            400,
+            f"Cannot retire {len(req.retire_indices)} custodians: "
+            f"would leave only {len(surviving_indices)} < k={k}",
+        )
+
+    # Assign x-coordinates for new custodians
+    max_existing_x = n
+    new_x_coords = req.onboard_x_coords or [
+        max_existing_x + 1 + i for i in range(len(req.onboard_urls))
+    ]
+
+    # Target set: surviving x-coords + new x-coords
+    target_x_coords = [i + 1 for i in surviving_indices] + new_x_coords
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Step 1: Generate sub-shares from surviving custodians
+        all_sub_shares: Dict[int, Dict[int, int]] = {}
+        for idx in surviving_indices:
+            url = f"{CUSTODIAN_URLS[idx]}/reshare_generate"
+            try:
+                resp = await client.post(url, json={
+                    "program_id": pid,
+                    "target_x_coords": target_x_coords,
+                    "k": k,
+                })
+                resp.raise_for_status()
+                body = resp.json()
+                sub_map = {int(x): int(str(v)) for x, v in body["sub_shares"].items()}
+                all_sub_shares[idx] = sub_map
+            except Exception:
+                pass
+
+        if len(all_sub_shares) < k:
+            raise HTTPException(
+                503,
+                f"Only {len(all_sub_shares)}/{k} custodians participated",
+            )
+
+        # Step 2: Apply sub-shares to surviving custodians
+        for idx in surviving_indices:
+            target_x = idx + 1
+            deltas = []
+            for sender_idx, sub_map in all_sub_shares.items():
+                if target_x in sub_map:
+                    deltas.append(sub_map[target_x])
+
+            url = f"{CUSTODIAN_URLS[idx]}/reshare_apply"
+            try:
+                await client.post(url, json={
+                    "program_id": pid,
+                    "sub_shares": [str(d) for d in deltas],
+                })
+            except Exception:
+                pass
+
+        # Step 3: Onboard new custodians — they need interpolated shares + sub-shares
+        # The coordinator asks surviving custodians for the Lagrange interpolation
+        # at new x-coordinates.  We use the sub-shares already generated.
+        # New custodian share = Lagrange_interpolation(x_new) + Σ sub_shares(x_new)
+        # Since we don't have the raw shares on the coordinator, we ask custodians
+        # to compute partial Lagrange terms and aggregate.
+        for i, new_url in enumerate(req.onboard_urls):
+            x_new = new_x_coords[i]
+            # Collect sub-shares for this new x-coordinate
+            deltas_for_new = []
+            for sender_idx, sub_map in all_sub_shares.items():
+                if x_new in sub_map:
+                    deltas_for_new.append(sub_map[x_new])
+
+            # Request Lagrange partial evaluations from surviving custodians
+            # Each surviving custodian sends L_i(x_new) * y_i
+            # The coordinator sums them → f(x_new), then adds sub-shares
+            lagrange_partials: List[int] = []
+            for idx in surviving_indices:
+                url = f"{CUSTODIAN_URLS[idx]}/reshare_lagrange_partial"
+                try:
+                    resp = await client.post(url, json={
+                        "program_id": pid,
+                        "target_x": x_new,
+                        "participant_x_coords": [si + 1 for si in surviving_indices[:k]],
+                    })
+                    resp.raise_for_status()
+                    body = resp.json()
+                    lagrange_partials.append(int(str(body["partial"])))
+                except Exception:
+                    pass
+
+                if len(lagrange_partials) >= k:
+                    break
+
+            # Sum partials to get f(x_new)
+            interpolated_y = 0
+            for p in lagrange_partials:
+                interpolated_y = field.add(interpolated_y, p)
+
+            # Add sub-shares
+            from quorumvm.crypto.resharing import apply_sub_shares
+            final_y = apply_sub_shares(interpolated_y, deltas_for_new)
+
+            # Send the new share to the onboarding custodian
+            try:
+                resp = await client.post(f"{new_url}/reshare_set_share", json={
+                    "program_id": pid,
+                    "share_x": x_new,
+                    "share_y": str(final_y),
+                    "program_package": _packages[pid],
+                })
+            except Exception:
+                pass
+
+        # Step 4: Retire custodians
+        for idx in req.retire_indices:
+            url = f"{CUSTODIAN_URLS[idx]}/reshare_retire/{pid}"
+            try:
+                await client.delete(url)
+            except Exception:
+                pass
+
+    _audit.append("rotate", {
+        "program_id": pid,
+        "retired": req.retire_indices,
+        "onboarded": len(req.onboard_urls),
+        "new_x_coords": new_x_coords,
+    })
+
+    return {
+        "status": "rotated",
+        "program_id": pid,
+        "retired": req.retire_indices,
+        "onboarded": len(req.onboard_urls),
+        "surviving": surviving_indices,
+    }

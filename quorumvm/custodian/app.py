@@ -459,6 +459,149 @@ def create_app(state: CustodianState | None = None) -> FastAPI:
             resp_p2p["outputs"] = {k: str(v) for k, v in multi_p2p.items()}
         return resp_p2p
 
+    # ------------------------------------------------------------------
+    # Phase 10: Proactive Resharing & Custodian Rotation
+    # ------------------------------------------------------------------
+
+    @app.post("/reshare_generate")
+    async def reshare_generate(req: Dict[str, Any]):
+        """Generate zero-share sub-shares for a resharing round.
+
+        Request body:
+            program_id: str
+            target_x_coords: list[int]  — x-coordinates of target custodians
+            k: int                      — threshold
+
+        Returns:
+            sub_shares: {str(x_j): str(δ_value)} — sub-shares to distribute
+        """
+        from quorumvm.crypto.resharing import generate_sub_shares
+
+        pid = req["program_id"]
+        if pid not in state.secret_shares:
+            raise HTTPException(404, "No secret share for this program")
+
+        target_x_coords = [int(x) for x in req["target_x_coords"]]
+        k = int(req["k"])
+
+        sub = generate_sub_shares(k, target_x_coords)
+        return {
+            "custodian": state.index,
+            "sub_shares": {str(x): str(v) for x, v in sub.items()},
+        }
+
+    @app.post("/reshare_apply")
+    async def reshare_apply(req: Dict[str, Any]):
+        """Apply received sub-shares to update this custodian's secret share.
+
+        Request body:
+            program_id: str
+            sub_shares: list[str]  — δ values from each participating custodian
+
+        Updates the stored share in-place.
+        """
+        from quorumvm.crypto.resharing import apply_sub_shares
+
+        pid = req["program_id"]
+        if pid not in state.secret_shares:
+            raise HTTPException(404, "No secret share for this program")
+
+        x, old_y = state.secret_shares[pid]
+        deltas = [int(str(d)) for d in req["sub_shares"]]
+        new_y = apply_sub_shares(old_y, deltas)
+        state.secret_shares[pid] = (x, new_y)
+
+        return {
+            "custodian": state.index,
+            "status": "reshared",
+            "x": x,
+        }
+
+    @app.post("/reshare_set_share")
+    async def reshare_set_share(req: Dict[str, Any]):
+        """Set a new share directly (used during custodian onboarding).
+
+        Request body:
+            program_id: str
+            share_x: int
+            share_y: str
+            program_package: dict  (optional — install program if not present)
+        """
+        pid = req["program_id"]
+        x = int(req["share_x"])
+        y = int(str(req["share_y"]))
+        state.secret_shares[pid] = (x, y)
+
+        # Optionally install program package
+        if "program_package" in req and pid not in state.installed:
+            state.installed[pid] = req["program_package"]
+
+        return {
+            "custodian": state.index,
+            "status": "share_set",
+            "x": x,
+        }
+
+    @app.post("/reshare_lagrange_partial")
+    async def reshare_lagrange_partial(req: Dict[str, Any]):
+        """Compute this custodian's Lagrange partial evaluation for rotation.
+
+        Returns L_i(target_x) * y_i, where L_i is the Lagrange basis
+        polynomial for this custodian among the specified participants.
+
+        Request body:
+            program_id: str
+            target_x: int
+            participant_x_coords: list[int]  — all participating x-coordinates
+        """
+        pid = req["program_id"]
+        if pid not in state.secret_shares:
+            raise HTTPException(404, "No secret share for this program")
+
+        x_i, y_i = state.secret_shares[pid]
+        target_x = int(req["target_x"])
+        participants = [int(x) for x in req["participant_x_coords"]]
+
+        # Compute Lagrange basis L_i(target_x)
+        from quorumvm.crypto import field as f
+        num = 1
+        den = 1
+        for x_m in participants:
+            if x_m == x_i:
+                continue
+            num = f.mul(num, f.sub(target_x, x_m))
+            den = f.mul(den, f.sub(x_i, x_m))
+
+        lagrange_coeff = f.mul(num, f.inv(den))
+        partial = f.mul(y_i, lagrange_coeff)
+
+        return {
+            "custodian": state.index,
+            "partial": str(partial),
+        }
+
+    @app.delete("/reshare_retire/{program_id}")
+    async def reshare_retire(program_id: str):
+        """Remove this custodian's share for a program (retirement).
+
+        The custodian deletes its secret share and beaver pools for the
+        specified program.  This is irreversible.
+        """
+        removed = False
+        if program_id in state.secret_shares:
+            del state.secret_shares[program_id]
+            removed = True
+        if program_id in state.beaver_pools:
+            del state.beaver_pools[program_id]
+        if program_id in state.installed:
+            del state.installed[program_id]
+
+        return {
+            "custodian": state.index,
+            "status": "retired" if removed else "not_found",
+            "program_id": program_id,
+        }
+
     @app.get("/health")
     async def health():
         return {"custodian": state.index, "status": "ok"}

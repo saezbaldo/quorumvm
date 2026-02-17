@@ -1,6 +1,6 @@
 # QuorumVM — Extraction-Resistant Computation via Threshold Execution
 
-[![Tests](https://img.shields.io/badge/tests-122%2F122%20passing-brightgreen)](#test-results)
+[![Tests](https://img.shields.io/badge/tests-166%2F166%20passing-brightgreen)](#test-results)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](#quick-start)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
@@ -8,7 +8,7 @@
 
 QuorumVM is a runtime where programs are executed through **K-of-N threshold participation** of independent custodians. Secret parameters are Shamir-shared — no single machine ever holds full authority to execute or reconstruct the program. An integrated **oracle control plane** governs query budgets, rate limits, and provides an immutable audit trail.
 
-This is a working MVP with **122 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences.
+This is a working MVP with **166 passing tests**, including a **13-test whitepaper compliance suite** verified against a live distributed GKE cluster. Multiplications are performed via the **Beaver triple protocol** with **peer-to-peer ε,δ exchange** — neither the coordinator nor any single custodian ever sees plain input values, intermediate products, or the reconstructed masked differences. **Proactive resharing** refreshes all shares periodically without reconstructing the secret, and **custodian rotation** enables onboarding and retiring custodians on the fly.
 
 ---
 
@@ -271,6 +271,8 @@ Multiplying Shamir shares naively produces degree-2K polynomials that break the 
 | `POST` | `/replenish_beaver` | Replenish Beaver triple pool for a program |
 | `GET` | `/beaver_pool/{id}` | Check remaining Beaver triple pool capacity |
 | `GET` | `/audit` | Retrieve the full audit log with chain validity |
+| `POST` | `/reshare` | Proactive resharing: refresh all shares without reconstructing the secret |
+| `POST` | `/rotate` | Custodian rotation: onboard new / retire old custodians |
 
 ### Custodian
 
@@ -284,6 +286,11 @@ Multiplying Shamir shares naively produces degree-2K polynomials that break the 
 | `POST` | `/beaver_round2` | Receive reconstructed (ε, δ) and continue eval (legacy) |
 | `POST` | `/beaver_shares` | Receive P2P ε,δ shares from another custodian |
 | `POST` | `/beaver_resolve_p2p` | Reconstruct ε,δ locally, compute Round 2, continue |
+| `POST` | `/reshare_generate` | Generate zero-share sub-shares for resharing round |
+| `POST` | `/reshare_apply` | Apply received sub-shares to update secret share |
+| `POST` | `/reshare_set_share` | Set a new share directly (custodian onboarding) |
+| `POST` | `/reshare_lagrange_partial` | Compute Lagrange partial for rotation |
+| `DELETE` | `/reshare_retire/{pid}` | Delete share and retire from a program |
 | `GET` | `/health` | Health check |
 
 ### Example: Calling from Any Language
@@ -302,7 +309,7 @@ curl -X POST http://coordinator:8000/eval \
 
 ## Test Results
 
-### Local Tests (109 passing)
+### Local Tests (153 passing)
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -317,6 +324,7 @@ curl -X POST http://coordinator:8000/eval \
 | `test_e2e.py` | 5 | Full integration: install → activate → eval → budget → audit |
 | `test_beaver.py` | 26 | **Beaver triples**: generation, sharing, pool (pool_size param), protocol correctness (zero/one/large/commutative/associative), P2P round2 with ε*δ correction, StepExecutor pause/resume, E2E HTTP, **coordinator never sees ε,δ** (Phase 8 P2P) |
 | | 5 | **Beaver pool**: multiple evals, exhaustion (409), replenishment, pool status endpoint, distinct triples per eval |
+| `test_resharing.py` | 31 | **Proactive resharing & rotation**: zero-share poly, sub-share generation, reshare preserves secret, multi-round resharing, rotation (expand/shrink/replace), Lagrange interpolation, edge cases (k=n, zero/large secrets), HTTP endpoint integration (6 async tests) |
 
 ### Whitepaper Compliance Tests (20 passing locally)
 

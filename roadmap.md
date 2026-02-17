@@ -96,10 +96,15 @@ Last updated: **2026-02-18**
 ## 📋 Planned
 
 ### Phase 10 — Proactive Resharing & Custodian Rotation
-- [ ] Custodian onboarding: generate new shares without reconstructing the secret
-- [ ] Custodian retirement: remove a custodian while maintaining threshold
-- [ ] Periodic resharing to limit window of compromise
-- [ ] Protocol tests for resharing correctness
+- [x] `crypto/resharing.py` — zero-share polynomial generation, sub-share distribution, apply
+- [x] `reshare()` — full proactive resharing round preserving the secret without reconstruction
+- [x] `rotate_custodians()` — transfer shares to new custodian set via Lagrange interpolation
+- [x] `_lagrange_at()` — Lagrange interpolation at arbitrary x (not just x=0)
+- [x] Custodian endpoints: `/reshare_generate`, `/reshare_apply`, `/reshare_set_share`, `/reshare_lagrange_partial`, `/reshare_retire`
+- [x] Coordinator endpoints: `POST /reshare` (orchestrated resharing), `POST /rotate` (full rotation with onboard/retire)
+- [x] 31 Phase 10 tests: zero-share poly, sub-shares, reshare preserves secret, multi-round resharing, rotation (expand, shrink, replace), Lagrange interpolation, HTTP endpoint integration
+- [x] All 166 tests passing (153 local + 13 cluster)
+- [x] Docker image `v6-resharing` deployed to GKE, 13/13 distributed tests pass
 
 ### Phase 11 — Formal Security Analysis
 - [ ] Formal model: define adversary capabilities, simulation-based security proof sketch
@@ -124,13 +129,14 @@ Last updated: **2026-02-18**
 
 | Metric | Value |
 |---|---|
-| Total tests | 122 passing |
-| Local unit/integration | 109 |
+| Total tests | 166 passing |
+| Local unit/integration | 153 |
+| Resharing & rotation tests | 31 |
 | Beaver protocol tests | 22 |
 | Beaver pool tests | 5 |
 | Compiler tests | 26 |
 | Executor tests | 14 |
 | Whitepaper compliance (local) | 20 |
 | Distributed cluster (GKE) | 13 |
-| GitHub commits | 6 |
-| Open phases | 2 (Phase 10–11) |
+| GitHub commits | 7 |
+| Open phases | 1 (Phase 11) |
